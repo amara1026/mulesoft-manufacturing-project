@@ -1,0 +1,456 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  MUnit suite for the order saga (prc-create-order-flow).
+  Outbound HTTP calls are mocked by doc:name; the embedded H2 database is real, so idempotency, the outbox and
+  the release of the idempotency claim are genuinely exercised.
+  Error-path tests wrap the flow in a try so they can assert both the error type AND what was (not) called.
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+      xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+      xmlns:db="http://www.mulesoft.org/schema/mule/db"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd
+http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd">
+
+    <munit:config name="prc-order-management-test-suite.xml"/>
+
+    <munit:before-suite name="prc-suite-create-schema" description="Create integration tables in H2">
+        <flow-ref name="create-schema-subflow" doc:name="Create schema"/>
+    </munit:before-suite>
+
+    <!-- ===================================================================================== -->
+    <munit:test name="T1-happy-path-full-stock-returns-201-confirmed"
+                description="Customer active, stock available, SAP creates the order: 201 CONFIRMED, one SAP call, outbox event written">
+        <munit:behavior>
+            <munit-tools:mock-when processor="http:request" doc:name="Mock CRM: active">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="Get customer from CRM System API"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value='#[{ customerId: "CUST-100234", name: "Riverside Water Utility", status: "ACTIVE" }]' mediaType="application/json"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="http:request" doc:name="Mock WMS: availability">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="Check availability in WMS System API"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value='#[{ location: "DC-US-01", lines: [ { lineNumber: 10, materialNumber: "PMP-CF-200", known: true, availableQty: 8 } ] }]' mediaType="application/json"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="http:request" doc:name="Mock WMS: reservation">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="Create soft reservation in WMS System API"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value='#[{ reservationId: "RSV-T1", expiresAt: "2026-10-13T09:00:00Z" }]' mediaType="application/json"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="http:request" doc:name="Mock SAP: 201">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="Create SAP sales order"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value='#[{ salesOrderNumber: "0000411111", recoveredAfterTimeout: false, warnings: [] }]' mediaType="application/json"/>
+                    <munit-tools:attributes value="#[{ statusCode: 201 }]"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event doc:name="Order in stock">
+                <munit:payload value="#[readUrl('classpath://test-data/order-instock.json', 'application/json')]" mediaType="application/json"/>
+                <munit:attributes value="#[{ headers: { 'idempotency-key': 'MUNIT-KEY-T1-0001' } }]"/>
+            </munit:set-event>
+            <flow-ref name="prc-create-order-flow" doc:name="Run order saga"/>
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-that expression="#[payload.status]" is="#[MunitTools::equalTo('CONFIRMED')]" message="status"/>
+            <munit-tools:assert-that expression="#[payload.sapOrderNumber]" is="#[MunitTools::equalTo('0000411111')]" message="SAP number"/>
+            <munit-tools:assert-that expression="#[vars.httpStatus as String]" is="#[MunitTools::equalTo('201')]" message="HTTP status"/>
+            <munit-tools:verify-call processor="http:request" times="1" doc:name="SAP called exactly once">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="Create SAP sales order"/>
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+            <set-variable variableName="createdOrderId" value="#[payload.orderId]" doc:name="createdOrderId"/>
+            <db:select config-ref="Database_Config" doc:name="Outbox rows for order">
+                <db:sql><![CDATA[SELECT event_type FROM outbox_event WHERE aggregate_id = :id]]></db:sql>
+                <db:input-parameters><![CDATA[#[{ id: vars.createdOrderId }]]]></db:input-parameters>
+            </db:select>
+            <munit-tools:assert-that expression="#[payload.event_type contains 'order.confirmed']" is="#[MunitTools::equalTo(true)]" message="order.confirmed in outbox"/>
+        </munit:validation>
+    </munit:test>
+
+    <!-- ===================================================================================== -->
+    <munit:test name="T2-partial-stock-returns-backordered-and-shortage-event"
+                description="40 valves requested, 5 available: BACKORDERED, backorderedQty 35, shortage event in outbox">
+        <munit:behavior>
+            <munit-tools:mock-when processor="http:request" doc:name="Mock CRM: active">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="Get customer from CRM System API"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value='#[{ customerId: "CUST-100234", status: "ACTIVE" }]' mediaType="application/json"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="http:request" doc:name="Mock WMS: partial availability">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="Check availability in WMS System API"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value='#[{ location: "DC-US-01", lines: [
+                        { lineNumber: 10, materialNumber: "PMP-CF-200", known: true, availableQty: 8 },
+                        { lineNumber: 20, materialNumber: "VLV-BL-050", known: true, availableQty: 5 } ] }]' mediaType="application/json"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="http:request" doc:name="Mock WMS: reservation">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="Create soft reservation in WMS System API"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value='#[{ reservationId: "RSV-T2" }]' mediaType="application/json"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="http:request" doc:name="Mock SAP: 201">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="Create SAP sales order"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value='#[{ salesOrderNumber: "0000422222", recoveredAfterTimeout: false }]' mediaType="application/json"/>
+                    <munit-tools:attributes value="#[{ statusCode: 201 }]"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event doc:name="Order with shortage">
+                <munit:payload value="#[readUrl('classpath://test-data/order-shortage.json', 'application/json')]" mediaType="application/json"/>
+                <munit:attributes value="#[{ headers: { 'idempotency-key': 'MUNIT-KEY-T2-0001' } }]"/>
+            </munit:set-event>
+            <flow-ref name="prc-create-order-flow" doc:name="Run order saga"/>
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-that expression="#[payload.status]" is="#[MunitTools::equalTo('BACKORDERED')]" message="status"/>
+            <munit-tools:assert-that expression="#[(payload.lines filter ($.lineNumber == 20))[0].backorderedQty as String]" is="#[MunitTools::equalTo('35')]" message="backordered valves"/>
+            <set-variable variableName="createdOrderId" value="#[payload.orderId]" doc:name="createdOrderId"/>
+            <db:select config-ref="Database_Config" doc:name="Outbox rows for order">
+                <db:sql><![CDATA[SELECT event_type FROM outbox_event WHERE aggregate_id = :id]]></db:sql>
+                <db:input-parameters><![CDATA[#[{ id: vars.createdOrderId }]]]></db:input-parameters>
+            </db:select>
+            <munit-tools:assert-that expression="#[payload.event_type contains 'inventory.shortage-detected']" is="#[MunitTools::equalTo(true)]" message="shortage event"/>
+            <munit-tools:assert-that expression="#[payload.event_type contains 'order.backordered']" is="#[MunitTools::equalTo(true)]" message="backordered event"/>
+        </munit:validation>
+    </munit:test>
+
+    <!-- ===================================================================================== -->
+    <munit:test name="T3-duplicate-request-replays-stored-response"
+                description="Same Idempotency-Key and body twice: identical response, SAP called once in total">
+        <munit:behavior>
+            <munit-tools:mock-when processor="http:request" doc:name="Mock CRM: active">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="Get customer from CRM System API"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value='#[{ customerId: "CUST-100234", status: "ACTIVE" }]' mediaType="application/json"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="http:request" doc:name="Mock WMS: availability">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="Check availability in WMS System API"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value='#[{ lines: [ { lineNumber: 10, materialNumber: "PMP-CF-200", known: true, availableQty: 8 } ] }]' mediaType="application/json"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="http:request" doc:name="Mock WMS: reservation">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="Create soft reservation in WMS System API"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value='#[{ reservationId: "RSV-T3" }]' mediaType="application/json"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="http:request" doc:name="Mock SAP: 201">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="Create SAP sales order"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value='#[{ salesOrderNumber: "0000433333", recoveredAfterTimeout: false }]' mediaType="application/json"/>
+                    <munit-tools:attributes value="#[{ statusCode: 201 }]"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event doc:name="First submission">
+                <munit:payload value="#[readUrl('classpath://test-data/order-instock.json', 'application/json')]" mediaType="application/json"/>
+                <munit:attributes value="#[{ headers: { 'idempotency-key': 'MUNIT-KEY-T3-0001' } }]"/>
+            </munit:set-event>
+            <flow-ref name="prc-create-order-flow" doc:name="First call"/>
+            <set-variable variableName="firstOrderId" value="#[payload.orderId]" doc:name="firstOrderId"/>
+            <set-payload value="#[readUrl('classpath://test-data/order-instock.json', 'application/json')]" mimeType="application/json" doc:name="Same body again"/>
+            <flow-ref name="prc-create-order-flow" doc:name="Second call (client retry)"/>
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-that expression="#[payload.orderId]" is="#[MunitTools::equalTo(vars.firstOrderId)]" message="same orderId replayed"/>
+            <munit-tools:assert-that expression="#[vars.replay]" is="#[MunitTools::equalTo(true)]" message="served from idempotency store"/>
+            <munit-tools:verify-call processor="http:request" times="1" doc:name="SAP called once in total">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="Create SAP sales order"/>
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <!-- ===================================================================================== -->
+    <munit:test name="T4-same-key-different-body-is-rejected"
+                description="Idempotency-Key reused with a different body: AIM:IDEMPOTENCY_KEY_REUSED">
+        <munit:behavior>
+            <munit-tools:mock-when processor="http:request" doc:name="Mock CRM: active">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="Get customer from CRM System API"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value='#[{ customerId: "CUST-100234", status: "ACTIVE" }]' mediaType="application/json"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="http:request" doc:name="Mock WMS: availability">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="Check availability in WMS System API"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value='#[{ lines: [ { lineNumber: 10, materialNumber: "PMP-CF-200", known: true, availableQty: 8 } ] }]' mediaType="application/json"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="http:request" doc:name="Mock WMS: reservation">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="Create soft reservation in WMS System API"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value='#[{ reservationId: "RSV-T4" }]' mediaType="application/json"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="http:request" doc:name="Mock SAP: 201">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="Create SAP sales order"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value='#[{ salesOrderNumber: "0000444444", recoveredAfterTimeout: false }]' mediaType="application/json"/>
+                    <munit-tools:attributes value="#[{ statusCode: 201 }]"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event doc:name="First submission">
+                <munit:payload value="#[readUrl('classpath://test-data/order-instock.json', 'application/json')]" mediaType="application/json"/>
+                <munit:attributes value="#[{ headers: { 'idempotency-key': 'MUNIT-KEY-T4-0001' } }]"/>
+            </munit:set-event>
+            <flow-ref name="prc-create-order-flow" doc:name="First call"/>
+            <set-payload value="#[readUrl('classpath://test-data/order-shortage.json', 'application/json')]" mimeType="application/json" doc:name="Different body, same key"/>
+            <try doc:name="Capture expected error">
+                <flow-ref name="prc-create-order-flow" doc:name="Second call"/>
+                <error-handler>
+                    <on-error-continue type="ANY" doc:name="Capture">
+                        <set-variable variableName="raisedError" value="#[error.errorType.namespace ++ ':' ++ error.errorType.identifier]" doc:name="raisedError"/>
+                    </on-error-continue>
+                </error-handler>
+            </try>
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-that expression="#[vars.raisedError]" is="#[MunitTools::equalTo('AIM:IDEMPOTENCY_KEY_REUSED')]" message="error type"/>
+            <munit-tools:verify-call processor="http:request" times="1" doc:name="No second SAP call">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="Create SAP sales order"/>
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <!-- ===================================================================================== -->
+    <munit:test name="T5-blocked-customer-stops-before-reservation-and-sap"
+                description="Credit-blocked customer: AIM:CUSTOMER_INVALID, no reservation, no SAP call, idempotency claim released">
+        <munit:behavior>
+            <munit-tools:mock-when processor="http:request" doc:name="Mock CRM: blocked">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="Get customer from CRM System API"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value='#[{ customerId: "CUST-100234", status: "BLOCKED" }]' mediaType="application/json"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="http:request" doc:name="Mock WMS: availability">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="Check availability in WMS System API"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value='#[{ lines: [ { lineNumber: 10, materialNumber: "PMP-CF-200", known: true, availableQty: 8 } ] }]' mediaType="application/json"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event doc:name="Order for blocked customer">
+                <munit:payload value="#[readUrl('classpath://test-data/order-instock.json', 'application/json')]" mediaType="application/json"/>
+                <munit:attributes value="#[{ headers: { 'idempotency-key': 'MUNIT-KEY-T5-0001' } }]"/>
+            </munit:set-event>
+            <try doc:name="Capture expected error">
+                <flow-ref name="prc-create-order-flow" doc:name="Run order saga"/>
+                <error-handler>
+                    <on-error-continue type="ANY" doc:name="Capture">
+                        <set-variable variableName="raisedError" value="#[error.errorType.namespace ++ ':' ++ error.errorType.identifier]" doc:name="raisedError"/>
+                    </on-error-continue>
+                </error-handler>
+            </try>
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-that expression="#[vars.raisedError]" is="#[MunitTools::equalTo('AIM:CUSTOMER_INVALID')]" message="error type"/>
+            <munit-tools:verify-call processor="http:request" times="0" doc:name="No reservation">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="Create soft reservation in WMS System API"/>
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+            <munit-tools:verify-call processor="http:request" times="0" doc:name="No SAP call">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="Create SAP sales order"/>
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+            <db:select config-ref="Database_Config" doc:name="Idempotency record left?">
+                <db:sql><![CDATA[SELECT COUNT(*) AS cnt FROM idempotency_record WHERE idempotency_key = 'MUNIT-KEY-T5-0001']]></db:sql>
+            </db:select>
+            <munit-tools:assert-that expression="#[payload[0].cnt as String]" is="#[MunitTools::equalTo('0')]" message="claim released so the client may retry"/>
+        </munit:validation>
+    </munit:test>
+
+    <!-- ===================================================================================== -->
+    <munit:test name="T6-sap-business-error-compensates-reservation"
+                description="SAP rejects (422): reservation released exactly once, AIM:SAP_BUSINESS_ERROR raised">
+        <munit:behavior>
+            <munit-tools:mock-when processor="http:request" doc:name="Mock CRM: active">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="Get customer from CRM System API"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value='#[{ customerId: "CUST-100234", status: "ACTIVE" }]' mediaType="application/json"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="http:request" doc:name="Mock WMS: availability">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="Check availability in WMS System API"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value='#[{ lines: [ { lineNumber: 10, materialNumber: "PMP-CF-200", known: true, availableQty: 8 } ] }]' mediaType="application/json"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="http:request" doc:name="Mock WMS: reservation">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="Create soft reservation in WMS System API"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value='#[{ reservationId: "RSV-T6" }]' mediaType="application/json"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="http:request" doc:name="Mock SAP: 422">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="Create SAP sales order"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value='#[{ error: { code: "AIM-SAP-4225", message: "Sold-to party blocked for sales (credit limit exceeded)" } }]' mediaType="application/json"/>
+                    <munit-tools:attributes value="#[{ statusCode: 422 }]"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="http:request" doc:name="Mock WMS: release">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="Release reservation in WMS System API"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value='#[{ reservationNo: "RSV-T6", released: true }]' mediaType="application/json"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event doc:name="Order SAP will reject">
+                <munit:payload value="#[readUrl('classpath://test-data/order-instock.json', 'application/json')]" mediaType="application/json"/>
+                <munit:attributes value="#[{ headers: { 'idempotency-key': 'MUNIT-KEY-T6-0001' } }]"/>
+            </munit:set-event>
+            <try doc:name="Capture expected error">
+                <flow-ref name="prc-create-order-flow" doc:name="Run order saga"/>
+                <error-handler>
+                    <on-error-continue type="ANY" doc:name="Capture">
+                        <set-variable variableName="raisedError" value="#[error.errorType.namespace ++ ':' ++ error.errorType.identifier]" doc:name="raisedError"/>
+                    </on-error-continue>
+                </error-handler>
+            </try>
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-that expression="#[vars.raisedError]" is="#[MunitTools::equalTo('AIM:SAP_BUSINESS_ERROR')]" message="error type"/>
+            <munit-tools:verify-call processor="http:request" times="1" doc:name="Compensation executed once">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="Release reservation in WMS System API"/>
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <!-- ===================================================================================== -->
+    <munit:test name="T7-sap-unknown-outcome-returns-202-pending-erp"
+                description="SAP System API answers 504 (unknown): 202 PENDING_ERP, reservation kept, erp-pending event in outbox">
+        <munit:behavior>
+            <munit-tools:mock-when processor="http:request" doc:name="Mock CRM: active">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="Get customer from CRM System API"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value='#[{ customerId: "CUST-100234", status: "ACTIVE" }]' mediaType="application/json"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="http:request" doc:name="Mock WMS: availability">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="Check availability in WMS System API"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value='#[{ lines: [ { lineNumber: 10, materialNumber: "PMP-CF-200", known: true, availableQty: 8 } ] }]' mediaType="application/json"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="http:request" doc:name="Mock WMS: reservation">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="Create soft reservation in WMS System API"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value='#[{ reservationId: "RSV-T7" }]' mediaType="application/json"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="http:request" doc:name="Mock SAP: 504">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="Create SAP sales order"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value='#[{ error: { code: "AIM-SAP-5041", message: "Outcome unknown" } }]' mediaType="application/json"/>
+                    <munit-tools:attributes value="#[{ statusCode: 504 }]"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event doc:name="Order while SAP is down">
+                <munit:payload value="#[readUrl('classpath://test-data/order-instock.json', 'application/json')]" mediaType="application/json"/>
+                <munit:attributes value="#[{ headers: { 'idempotency-key': 'MUNIT-KEY-T7-0001' } }]"/>
+            </munit:set-event>
+            <flow-ref name="prc-create-order-flow" doc:name="Run order saga"/>
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-that expression="#[payload.status]" is="#[MunitTools::equalTo('PENDING_ERP')]" message="status"/>
+            <munit-tools:assert-that expression="#[vars.httpStatus as String]" is="#[MunitTools::equalTo('202')]" message="HTTP status"/>
+            <munit-tools:verify-call processor="http:request" times="0" doc:name="No compensation on unknown outcome">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="Release reservation in WMS System API"/>
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+            <set-variable variableName="createdOrderId" value="#[payload.orderId]" doc:name="createdOrderId"/>
+            <db:select config-ref="Database_Config" doc:name="Outbox rows for order">
+                <db:sql><![CDATA[SELECT event_type FROM outbox_event WHERE aggregate_id = :id]]></db:sql>
+                <db:input-parameters><![CDATA[#[{ id: vars.createdOrderId }]]]></db:input-parameters>
+            </db:select>
+            <munit-tools:assert-that expression="#[payload.event_type contains 'order.erp-pending']" is="#[MunitTools::equalTo(true)]" message="erp-pending event"/>
+        </munit:validation>
+    </munit:test>
+</mule>

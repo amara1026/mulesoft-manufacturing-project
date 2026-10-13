@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Creates the integration tables at startup (local H2 only). In real environments schema changes are
+  owned by a DB migration pipeline (Flyway/Liquibase), never by the Mule app.
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:db="http://www.mulesoft.org/schema/mule/db"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd">
+
+    <flow name="db-init-on-startup-flow" maxConcurrency="1">
+        <scheduler doc:name="Run at startup (then daily, harmless)">
+            <scheduling-strategy>
+                <fixed-frequency frequency="1" timeUnit="DAYS" startDelay="0"/>
+            </scheduling-strategy>
+        </scheduler>
+        <flow-ref name="create-schema-subflow" doc:name="Create schema"/>
+    </flow>
+
+    <sub-flow name="create-schema-subflow">
+        <db:execute-script config-ref="Database_Config" file="sql/schema.sql" doc:name="Create tables if missing"/>
+        <logger level="INFO" category="aim.db" message="Integration schema ready" doc:name="Schema ready"/>
+    </sub-flow>
+</mule>

@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  TRANSACTIONAL OUTBOX RELAY
+  Publishes PENDING outbox rows to queues, then marks them PUBLISHED. A crash between publish and update
+  re-publishes the event (at-least-once) - consumers deduplicate with the inbox table.
+  Content-based routing decides the destination by event type.
+
+  Production notes: with several replicas use SELECT ... FOR UPDATE SKIP LOCKED (PostgreSQL) or a clustered/
+  single-replica relay; publish to Anypoint MQ exchanges instead of VM queues.
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:db="http://www.mulesoft.org/schema/mule/db"
+      xmlns:vm="http://www.mulesoft.org/schema/mule/vm"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+http://www.mulesoft.org/schema/mule/vm http://www.mulesoft.org/schema/mule/vm/current/mule-vm.xsd">
+
+    <flow name="outbox-relay-flow" maxConcurrency="1">
+        <scheduler doc:name="Poll outbox">
+            <scheduling-strategy>
+                <fixed-frequency frequency="${outbox.pollSeconds}" timeUnit="SECONDS" startDelay="5"/>
+            </scheduling-strategy>
+        </scheduler>
+        <db:select config-ref="Database_Config" doc:name="Fetch pending outbox events (oldest first)">
+            <db:sql><![CDATA[SELECT event_id, event_type, payload FROM outbox_event
+                             WHERE status = 'PENDING' ORDER BY created_at FETCH FIRST 50 ROWS ONLY]]></db:sql>
+        </db:select>
+        <foreach doc:name="Publish each event">
+            <set-variable variableName="evt" value="#[payload]" doc:name="evt"/>
+            <try doc:name="Publish one event">
+                <choice doc:name="Route by event type (content-based routing)">
+                    <when expression="#[vars.evt.event_type == 'inventory.shortage-detected']">
+                        <vm:publish config-ref="VM_Config" queueName="procurement-requests" doc:name="Publish to procurement-requests">
+                            <vm:content><![CDATA[#[output application/json --- read(vars.evt.payload, "application/json")]]]></vm:content>
+                        </vm:publish>
+                    </when>
+                    <when expression="#[vars.evt.event_type == 'order.erp-pending']">
+                        <vm:publish config-ref="VM_Config" queueName="erp-retry" doc:name="Publish to erp-retry">
+                            <vm:content><![CDATA[#[output application/json --- read(vars.evt.payload, "application/json")]]]></vm:content>
+                        </vm:publish>
+                    </when>
+                    <otherwise>
+                        <vm:publish config-ref="VM_Config" queueName="order-events" doc:name="Publish to order-events">
+                            <vm:content><![CDATA[#[output application/json --- read(vars.evt.payload, "application/json")]]]></vm:content>
+                        </vm:publish>
+                    </otherwise>
+                </choice>
+                <db:update config-ref="Database_Config" doc:name="Mark event published">
+                    <db:sql><![CDATA[UPDATE outbox_event SET status = 'PUBLISHED', published_at = CURRENT_TIMESTAMP WHERE event_id = :id]]></db:sql>
+                    <db:input-parameters><![CDATA[#[{ id: vars.evt.event_id }]]]></db:input-parameters>
+                </db:update>
+                <logger level="INFO" category="aim.outbox" doc:name="Log published"
+                        message="#['OUTBOX_PUBLISHED ' ++ vars.evt.event_type ++ ' ' ++ vars.evt.event_id]"/>
+                <error-handler>
+                    <on-error-continue type="ANY" doc:name="Leave PENDING, count attempt">
+                        <db:update config-ref="Database_Config" doc:name="Increment attempts">
+                            <db:sql><![CDATA[UPDATE outbox_event SET attempts = attempts + 1 WHERE event_id = :id]]></db:sql>
+                            <db:input-parameters><![CDATA[#[{ id: vars.evt.event_id }]]]></db:input-parameters>
+                        </db:update>
+                        <logger level="WARN" category="aim.outbox" doc:name="Log publish failure"
+                                message="#['OUTBOX_PUBLISH_FAILED ' ++ vars.evt.event_id ++ ' - will retry on next poll']"/>
+                    </on-error-continue>
+                </error-handler>
+            </try>
+        </foreach>
+    </flow>
+</mule>

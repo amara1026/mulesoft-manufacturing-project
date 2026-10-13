@@ -1,0 +1,343 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SIMULATED BACKENDS (port 8091) - stand-ins for SAP, WMS, Salesforce and SupplierHub so the project runs
+  without licences. Behaviour is driven by test data:
+
+  SAP (customerPoNumber prefix):
+    TIMEOUT-...  commits the order, then answers too slowly  -> System API times out, finds it by reference (201)
+    SAPDOWN-...  first call hangs WITHOUT committing; later calls succeed -> 202 PENDING_ERP, then ERP retry confirms
+    REJECT-...   BAPI RETURN TYPE E (credit block)            -> 422 + reservation released (compensation)
+  CRM:     CUST-100234, CUST-200500 active; CUST-BLOCKED credit-blocked; anything else 404
+  WMS:     fixed stock table (VLV-BL-050 has only 5 available; MTR-7.5KW has 0; unknown SKUs are "known: false")
+  Supplier: MTR-7.5KW fails with 503 until POST /mock/admin/supplier-outage/resolve is called (DLQ + replay demo)
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
+
+    <!-- ===================== Mock SAP ===================== -->
+    <flow name="mock-sap-create-sales-order-flow">
+        <http:listener config-ref="HTTP_Listener_Mock" path="/mock/sap/sales-orders" allowedMethods="POST" doc:name="Mock SAP: BAPI_SALESORDER_CREATEFROMDAT2"/>
+        <ee:transform doc:name="Read BAPI request">
+            <ee:variables>
+                <ee:set-variable variableName="mockReq"><![CDATA[%dw 2.0
+output application/java
+var bapi = payload.BAPI_SALESORDER_CREATEFROMDAT2
+var po = (bapi."import".ORDER_HEADER_IN.PURCH_NO_C default "") as String
+---
+{
+  ref: trim((bapi.tables.EXTENSIONIN.row.VALUEPART1 default "") as String),
+  customer: (bapi.tables.ORDER_PARTNERS.row.PARTN_NUMB default "") as String,
+  scenario: if (po startsWith "TIMEOUT-") "SLOW_COMMIT"
+            else if (po startsWith "SAPDOWN-") "OUTAGE_ONCE"
+            else if (po startsWith "REJECT-") "REJECT"
+            else "OK"
+}]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+        <set-variable variableName="ref" value="#[vars.mockReq.ref]" doc:name="ref"/>
+        <choice doc:name="Simulated SAP behaviour">
+            <when expression="#[vars.mockReq.scenario == 'REJECT']">
+                <logger level="WARN" category="aim.mock.sap" doc:name="Log reject" message="#['MOCK SAP: rejecting order ' ++ vars.ref ++ ' (credit block)']"/>
+                <ee:transform doc:name="BAPI RETURN with TYPE E">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/xml
+---
+BAPI_SALESORDER_CREATEFROMDAT2: {
+  "export": { SALESDOCUMENT: "" },
+  tables: {
+    RETURN: {
+      row: { TYPE: "E", ID: "V1", NUMBER: "154", MESSAGE: "Sold-to party " ++ vars.mockReq.customer ++ " blocked for sales (credit limit exceeded)" }
+    }
+  }
+}]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </when>
+            <when expression="#[vars.mockReq.scenario == 'OUTAGE_ONCE']">
+                <os:contains key="#['outage-' ++ vars.ref]" objectStore="SAP_Mock_Store" target="outageSeen" doc:name="Outage already simulated for this order?"/>
+                <choice doc:name="First call?">
+                    <when expression="#[vars.outageSeen]">
+                        <flow-ref name="mock-sap-commit-subflow" doc:name="SAP is back: commit"/>
+                    </when>
+                    <otherwise>
+                        <os:store key="#['outage-' ++ vars.ref]" objectStore="SAP_Mock_Store" doc:name="Remember outage">
+                            <os:value>#[true]</os:value>
+                        </os:store>
+                        <logger level="WARN" category="aim.mock.sap" doc:name="Log outage" message="#['MOCK SAP: simulating outage for ' ++ vars.ref ++ ' (no commit, slow answer)']"/>
+                        <ee:transform doc:name="Hang without committing">
+                            <ee:message>
+                                <ee:set-payload><![CDATA[%dw 2.0
+import * from dw::Runtime
+output application/json
+---
+wait({ simulated: "outage" }, p('mock.sap.slowDelayMs') as Number)]]></ee:set-payload>
+                            </ee:message>
+                        </ee:transform>
+                    </otherwise>
+                </choice>
+            </when>
+            <otherwise>
+                <flow-ref name="mock-sap-commit-subflow" doc:name="Commit sales order"/>
+                <choice doc:name="Slow after commit?">
+                    <when expression="#[vars.mockReq.scenario == 'SLOW_COMMIT']">
+                        <logger level="WARN" category="aim.mock.sap" doc:name="Log slow" message="#['MOCK SAP: committed ' ++ vars.ref ++ ', now answering slowly']"/>
+                        <ee:transform doc:name="Slow response after commit">
+                            <ee:message>
+                                <ee:set-payload><![CDATA[%dw 2.0
+import * from dw::Runtime
+output application/xml
+---
+wait(payload, p('mock.sap.slowDelayMs') as Number)]]></ee:set-payload>
+                            </ee:message>
+                        </ee:transform>
+                    </when>
+                </choice>
+            </otherwise>
+        </choice>
+    </flow>
+
+    <!-- Like real SAP, the mock does NOT deduplicate: every create makes a new document. Idempotency is our job. -->
+    <sub-flow name="mock-sap-commit-subflow">
+        <os:retrieve key="#['so-' ++ vars.ref]" objectStore="SAP_Mock_Store" target="existingDocs" doc:name="Existing documents for reference">
+            <os:default-value>#[[]]</os:default-value>
+        </os:retrieve>
+        <set-variable variableName="newDoc" value="#['00004' ++ ((randomInt(90000) + 10000) as String)]" doc:name="New SAP document number"/>
+        <os:store key="#['so-' ++ vars.ref]" objectStore="SAP_Mock_Store" doc:name="Commit document">
+            <os:value>#[vars.existingDocs ++ [vars.newDoc]]</os:value>
+        </os:store>
+        <logger level="INFO" category="aim.mock.sap" doc:name="Log commit"
+                message="#['MOCK SAP: committed sales order ' ++ vars.newDoc ++ ' for ' ++ vars.ref ++ ' (documents for this reference: ' ++ ((sizeOf(vars.existingDocs) + 1) as String) ++ ')']"/>
+        <ee:transform doc:name="BAPI success response">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/xml
+---
+BAPI_SALESORDER_CREATEFROMDAT2: {
+  "export": { SALESDOCUMENT: vars.newDoc },
+  tables: {
+    RETURN: {
+      row: { TYPE: "S", ID: "V1", NUMBER: "311", MESSAGE: "Standard Order " ++ vars.newDoc ++ " has been saved" }
+    }
+  }
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </sub-flow>
+
+    <!-- Mock OData-style lookup: GET /mock/sap/sales-orders?externalRef=... (documentCount shows whether duplicates exist) -->
+    <flow name="mock-sap-find-sales-order-flow">
+        <http:listener config-ref="HTTP_Listener_Mock" path="/mock/sap/sales-orders" allowedMethods="GET" doc:name="Mock SAP: find by reference"/>
+        <os:retrieve key="#['so-' ++ (attributes.queryParams.externalRef default '')]" objectStore="SAP_Mock_Store" target="docs" doc:name="Documents for reference">
+            <os:default-value>#[[]]</os:default-value>
+        </os:retrieve>
+        <ee:transform doc:name="Lookup response">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  found: not isEmpty(vars.docs),
+  (salesOrderNumber: vars.docs[0]) if (not isEmpty(vars.docs)),
+  documentCount: sizeOf(vars.docs),
+  documents: vars.docs
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- ===================== Mock WMS ===================== -->
+    <flow name="mock-wms-availability-flow">
+        <http:listener config-ref="HTTP_Listener_Mock" path="/mock/wms/availability" allowedMethods="POST" doc:name="Mock WMS: stock query"/>
+        <ee:transform doc:name="Stock table lookup">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var stock = {
+  "PMP-CF-200":   { onHand: 12,  reserved: 4 },
+  "VLV-BL-050":   { onHand: 9,   reserved: 4 },
+  "SEAL-MECH-40": { onHand: 100, reserved: 0 },
+  "CSG-SS-200":   { onHand: 3,   reserved: 1 },
+  "MTR-7.5KW":    { onHand: 0,   reserved: 0 }
+}
+---
+{
+  warehouse: payload.warehouse default "DC-US-01",
+  asOf: now() as String { format: "yyyy-MM-dd'T'HH:mm:ssXXX" },
+  items: (payload.items default []) map (i) -> do {
+    var s = stock[i.sku]
+    ---
+    { sku: i.sku, known: s != null, onHand: s.onHand default 0, reserved: s.reserved default 0 }
+  }
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <flow name="mock-wms-create-reservation-flow">
+        <http:listener config-ref="HTTP_Listener_Mock" path="/mock/wms/reservations" allowedMethods="POST" doc:name="Mock WMS: create reservation">
+            <http:response statusCode="201"/>
+        </http:listener>
+        <ee:transform doc:name="Reservation created">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  reservationNo: "RSV-" ++ ((randomInt(900000) + 100000) as String),
+  externalReference: payload.externalReference,
+  expiresAt: (now() + (("PT" ++ ((payload.expiresInMinutes default 30) as String) ++ "M") as Period)) as String { format: "yyyy-MM-dd'T'HH:mm:ssXXX" },
+  items: payload.items
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <logger level="INFO" category="aim.mock.wms" doc:name="Log reservation" message="#['MOCK WMS: reserved ' ++ payload.reservationNo ++ ' for ' ++ (payload.externalReference default '?')]"/>
+    </flow>
+
+    <flow name="mock-wms-release-reservation-flow">
+        <http:listener config-ref="HTTP_Listener_Mock" path="/mock/wms/reservations/{id}" allowedMethods="DELETE" doc:name="Mock WMS: release reservation"/>
+        <logger level="INFO" category="aim.mock.wms" doc:name="Log release" message="#['MOCK WMS: released reservation ' ++ attributes.uriParams.id]"/>
+        <ee:transform doc:name="Released">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ reservationNo: attributes.uriParams.id, released: true }]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- ===================== Mock Salesforce (CRM) ===================== -->
+    <flow name="mock-crm-get-account-flow">
+        <http:listener config-ref="HTTP_Listener_Mock" path="/mock/crm/accounts/{id}" allowedMethods="GET" doc:name="Mock Salesforce: Account">
+            <http:response statusCode="#[vars.mockStatus default 200]"/>
+        </http:listener>
+        <ee:transform doc:name="Account lookup">
+            <ee:variables>
+                <ee:set-variable variableName="account"><![CDATA[%dw 2.0
+output application/java
+var accounts = {
+  "CUST-100234":  { Id: "0015g00000RIVER", Name: "Riverside Water Utility", AIM_Customer_Id__c: "CUST-100234",  Status__c: "Active", Credit_Block__c: false },
+  "CUST-200500":  { Id: "0015g00000GULFC", Name: "Gulf Coast Chemicals",    AIM_Customer_Id__c: "CUST-200500",  Status__c: "Active", Credit_Block__c: false },
+  "CUST-BLOCKED": { Id: "0015g00000OVERD", Name: "Overdue Industries",      AIM_Customer_Id__c: "CUST-BLOCKED", Status__c: "Active", Credit_Block__c: true }
+}
+---
+accounts[attributes.uriParams.id]]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+        <choice doc:name="Account exists?">
+            <when expression="#[vars.account == null]">
+                <set-variable variableName="mockStatus" value="#[404]" doc:name="404"/>
+                <ee:transform doc:name="Salesforce-style NOT_FOUND">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+[ { errorCode: "NOT_FOUND", message: "The requested resource does not exist" } ]]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </when>
+            <otherwise>
+                <ee:transform doc:name="Account record">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+vars.account]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </otherwise>
+        </choice>
+    </flow>
+
+    <flow name="mock-crm-update-order-status-flow">
+        <http:listener config-ref="HTTP_Listener_Mock" path="/mock/crm/orders/{id}/status" allowedMethods="PATCH" doc:name="Mock Salesforce: Order upsert"/>
+        <logger level="INFO" category="aim.mock.crm" doc:name="Log status update"
+                message="#['MOCK SALESFORCE: order ' ++ attributes.uriParams.id ++ ' -> ' ++ (payload.Status default '?') ++ ' (SAP ' ++ (payload.SAP_Order_Number__c default '-') ++ ')']"/>
+        <ee:transform doc:name="Upsert result">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ id: attributes.uriParams.id, success: true, created: false }]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- ===================== Mock SupplierHub ===================== -->
+    <flow name="mock-supplier-create-requisition-flow">
+        <http:listener config-ref="HTTP_Listener_Mock" path="/mock/supplier/purchase-requisitions" allowedMethods="POST" doc:name="Mock SupplierHub: requisition">
+            <http:response statusCode="#[vars.mockStatus default 201]"/>
+        </http:listener>
+        <set-variable variableName="key" value="#[attributes.headers.'idempotency-key' default '']" doc:name="Idempotency-Key"/>
+        <set-variable variableName="material" value="#[payload.item.materialCode default '']" doc:name="material"/>
+        <os:retrieve key="supplier-outage-resolved" objectStore="Supplier_Mock_Store" target="outageResolved" doc:name="Outage resolved?">
+            <os:default-value>#[false]</os:default-value>
+        </os:retrieve>
+        <choice doc:name="Simulated supplier behaviour">
+            <when expression="#[vars.material == 'MTR-7.5KW' and not vars.outageResolved]">
+                <set-variable variableName="mockStatus" value="#[503]" doc:name="503"/>
+                <logger level="WARN" category="aim.mock.supplier" doc:name="Log outage" message="#['MOCK SUPPLIERHUB: unavailable for ' ++ vars.material]"/>
+                <ee:transform doc:name="Unavailable">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ error: "SupplierHub temporarily unavailable" }]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </when>
+            <otherwise>
+                <os:contains key="#['req-' ++ vars.key]" objectStore="Supplier_Mock_Store" target="seen" doc:name="Key seen before?"/>
+                <choice doc:name="Duplicate request?">
+                    <when expression="#[vars.seen]">
+                        <os:retrieve key="#['req-' ++ vars.key]" objectStore="Supplier_Mock_Store" target="requisitionNo" doc:name="Stored requisition"/>
+                        <set-variable variableName="mockStatus" value="#[200]" doc:name="200"/>
+                        <set-variable variableName="replayed" value="#[true]" doc:name="replayed"/>
+                    </when>
+                    <otherwise>
+                        <set-variable variableName="requisitionNo" value="#['PR-' ++ ((randomInt(900000) + 100000) as String)]" doc:name="New requisition number"/>
+                        <os:store key="#['req-' ++ vars.key]" objectStore="Supplier_Mock_Store" doc:name="Store requisition">
+                            <os:value>#[vars.requisitionNo]</os:value>
+                        </os:store>
+                        <set-variable variableName="replayed" value="#[false]" doc:name="not replayed"/>
+                    </otherwise>
+                </choice>
+                <logger level="INFO" category="aim.mock.supplier" doc:name="Log requisition"
+                        message="#['MOCK SUPPLIERHUB: requisition ' ++ vars.requisitionNo ++ ' key=' ++ vars.key ++ ' replayed=' ++ (vars.replayed as String)]"/>
+                <ee:transform doc:name="Requisition response">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ requisitionNo: vars.requisitionNo, replayed: vars.replayed }]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </otherwise>
+        </choice>
+    </flow>
+
+    <!-- Admin switch for the DLQ/replay demo -->
+    <flow name="mock-admin-resolve-supplier-outage-flow">
+        <http:listener config-ref="HTTP_Listener_Mock" path="/mock/admin/supplier-outage/resolve" allowedMethods="POST" doc:name="Mock admin: resolve supplier outage"/>
+        <os:store key="supplier-outage-resolved" objectStore="Supplier_Mock_Store" doc:name="Mark resolved">
+            <os:value>#[true]</os:value>
+        </os:store>
+        <ee:transform doc:name="Resolved">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ supplierOutage: "resolved" }]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+</mule>

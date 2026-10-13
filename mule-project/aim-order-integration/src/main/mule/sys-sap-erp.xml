@@ -1,0 +1,182 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SYSTEM LAYER: sap-erp-sys-api
+  Hides SAP specifics: BAPI XML shape, ALPHA conversion, UoM codes, RETURN-table errors, timeout recovery.
+  Here SAP is simulated by mock-backends.xml over HTTP. With a real SAP system, the http:request calls are
+  replaced by SAP Connector operations (BAPI + BAPI_TRANSACTION_COMMIT on the same session) and the lookup by
+  an OData query (API_SALES_ORDER_SRV) - consumers of this API do not change.
+
+  Contract:  201 created | 422 SAP business error | 504 outcome unknown (caller must NOT blind-retry)
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <!-- POST /sys/sap/v1/sales-orders -->
+    <flow name="sys-sap-create-sales-order-listener-flow">
+        <http:listener config-ref="HTTP_Listener_Sys" path="/sys/sap/v1/sales-orders" allowedMethods="POST" doc:name="POST /sales-orders">
+            <http:response statusCode="#[vars.httpStatus default 201]"/>
+            <http:error-response statusCode="#[vars.httpStatus default 500]">
+                <http:body><![CDATA[#[payload]]]></http:body>
+            </http:error-response>
+        </http:listener>
+        <flow-ref name="sys-sap-create-sales-order-flow" doc:name="Create sales order"/>
+    </flow>
+
+    <!-- GET /sys/sap/v1/sales-orders?externalRef=... (used by the ERP retry consumer: lookup BEFORE create) -->
+    <flow name="sys-sap-find-sales-order-listener-flow">
+        <http:listener config-ref="HTTP_Listener_Sys" path="/sys/sap/v1/sales-orders" allowedMethods="GET" doc:name="GET /sales-orders?externalRef=">
+            <http:response statusCode="#[vars.httpStatus default 200]"/>
+            <http:error-response statusCode="#[vars.httpStatus default 500]">
+                <http:body><![CDATA[#[payload]]]></http:body>
+            </http:error-response>
+        </http:listener>
+        <set-variable variableName="externalRef" value="#[attributes.queryParams.externalRef default '']" doc:name="externalRef"/>
+        <flow-ref name="sys-sap-lookup-by-reference-flow" doc:name="Lookup by external reference"/>
+        <choice doc:name="Lookup conclusive?">
+            <when expression="#[payload.outcome == 'UNKNOWN_LOOKUP_FAILED']">
+                <set-variable variableName="httpStatus" value="#[503]" doc:name="503"/>
+            </when>
+        </choice>
+        <ee:transform doc:name="Lookup result">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  found: payload.outcome == "CREATED",
+  (salesOrderNumber: payload.salesOrderNumber) if (payload.outcome == "CREATED")
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <flow name="sys-sap-create-sales-order-flow">
+        <set-variable variableName="externalRef" value="#[payload.orderId]" doc:name="externalRef = orderId"/>
+        <ee:transform doc:name="Canonical order to BAPI XML">
+            <ee:message>
+                <ee:set-payload resource="dwl/canonical-to-bapi-salesorder.dwl"/>
+            </ee:message>
+        </ee:transform>
+        <try doc:name="Call SAP with timeout recovery">
+            <http:request method="POST" config-ref="HTTP_Request_Mock_Backends" path="/mock/sap/sales-orders"
+                          responseTimeout="${timeouts.sapCreateMs}" doc:name="BAPI_SALESORDER_CREATEFROMDAT2 (mock SAP)">
+                <http:headers><![CDATA[#[{ 'x-correlation-id': correlationId }]]]></http:headers>
+            </http:request>
+            <ee:transform doc:name="Interpret BAPI RETURN table">
+                <ee:message>
+                    <ee:set-payload resource="dwl/bapi-response-to-result.dwl"/>
+                </ee:message>
+            </ee:transform>
+            <error-handler>
+                <on-error-continue type="HTTP:TIMEOUT" doc:name="Timeout = unknown outcome, look it up">
+                    <logger level="WARN" category="aim.sap" doc:name="Log SAP timeout"
+                            message="#['SAP_TIMEOUT externalRef=' ++ vars.externalRef ++ ' - looking up by reference before deciding']"/>
+                    <flow-ref name="sys-sap-lookup-by-reference-flow" doc:name="Lookup sales order by external reference"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+        <choice doc:name="Map outcome to contract">
+            <when expression="#[payload.outcome == 'CREATED']">
+                <set-variable variableName="httpStatus" value="#[201]" doc:name="201"/>
+                <logger level="INFO" category="aim.sap" doc:name="Log created"
+                        message="#['SAP_ORDER_CREATED externalRef=' ++ vars.externalRef ++ ' salesOrder=' ++ payload.salesOrderNumber ++ ' recoveredAfterTimeout=' ++ (payload.recoveredAfterTimeout as String)]"/>
+                <ee:transform doc:name="Created response">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  salesOrderNumber: payload.salesOrderNumber,
+  recoveredAfterTimeout: payload.recoveredAfterTimeout,
+  warnings: (payload.messages default []) filter ($.severity == "W")
+}]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </when>
+            <when expression="#[payload.outcome == 'REJECTED']">
+                <set-variable variableName="httpStatus" value="#[422]" doc:name="422"/>
+                <ee:transform doc:name="SAP business error response">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+import isoNow from dwl::modules::aim::common
+output application/json
+var errs = (payload.messages default []) filter (["E", "A"] contains $.severity)
+---
+{
+  error: {
+    code: "AIM-SAP-4225",
+    message: (errs map $.text) joinBy "; ",
+    correlationId: correlationId,
+    timestamp: isoNow(),
+    details: errs map { field: "sap", issue: $.code ++ " " ++ $.text }
+  }
+}]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </when>
+            <otherwise>
+                <set-variable variableName="httpStatus" value="#[504]" doc:name="504"/>
+                <ee:transform doc:name="Unknown outcome response">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+import isoNow from dwl::modules::aim::common
+output application/json
+---
+{
+  error: {
+    code: "AIM-SAP-5041",
+    message: "SAP did not confirm in time and the order was not found by reference. Outcome unknown - do not blind-retry; use lookup-then-create.",
+    correlationId: correlationId,
+    timestamp: isoNow()
+  }
+}]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </otherwise>
+        </choice>
+    </flow>
+
+    <!-- Lookup by our business reference (real SAP: OData API_SALES_ORDER_SRV with $filter on the custom reference field) -->
+    <flow name="sys-sap-lookup-by-reference-flow">
+        <try doc:name="Lookup (failure keeps the outcome unknown)">
+            <http:request method="GET" config-ref="HTTP_Request_Mock_Backends" path="/mock/sap/sales-orders"
+                          responseTimeout="${timeouts.sapLookupMs}" doc:name="Lookup SAP order by external reference (mock OData)">
+                <http:headers><![CDATA[#[{ 'x-correlation-id': correlationId }]]]></http:headers>
+                <http:query-params><![CDATA[#[{ externalRef: vars.externalRef }]]]></http:query-params>
+            </http:request>
+            <ee:transform doc:name="Lookup to result">
+                <ee:message>
+                    <ee:set-payload><![CDATA[%dw 2.0
+output application/java
+---
+{
+  outcome: if (payload.found default false) "CREATED" else "UNKNOWN",
+  salesOrderNumber: payload.salesOrderNumber,
+  recoveredAfterTimeout: payload.found default false,
+  messages: []
+}]]></ee:set-payload>
+                </ee:message>
+            </ee:transform>
+            <error-handler>
+                <on-error-continue type="ANY" doc:name="Lookup failed">
+                    <logger level="WARN" category="aim.sap" doc:name="Log lookup failure"
+                            message="#['SAP_LOOKUP_FAILED externalRef=' ++ vars.externalRef ++ ' (' ++ (error.description default '') ++ ')']"/>
+                    <ee:transform doc:name="Unknown">
+                        <ee:message>
+                            <ee:set-payload><![CDATA[%dw 2.0
+output application/java
+---
+{ outcome: "UNKNOWN_LOOKUP_FAILED", salesOrderNumber: null, recoveredAfterTimeout: false, messages: [] }]]></ee:set-payload>
+                        </ee:message>
+                    </ee:transform>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+</mule>

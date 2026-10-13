@@ -1,0 +1,147 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  MUnit suite for the SAP System API: BAPI mapping (golden assertions), RETURN-table handling,
+  and the "timeout = unknown outcome -> lookup by reference" behaviour.
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+      xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <munit:config name="sys-sap-erp-test-suite.xml"/>
+
+    <!-- ===================================================================================== -->
+    <munit:test name="S1-bapi-mapping-alpha-uom-reference"
+                description="Canonical order to BAPI XML: ALPHA-padded customer, SAP UoM codes, upper-case material, reference in EXTENSIONIN">
+        <munit:execution>
+            <munit:set-event doc:name="Canonical order">
+                <munit:payload value="#[readUrl('classpath://test-data/canonical-order-for-sap.json', 'application/json')]" mediaType="application/json"/>
+            </munit:set-event>
+            <ee:transform doc:name="Run production mapping">
+                <ee:message>
+                    <ee:set-payload resource="dwl/canonical-to-bapi-salesorder.dwl"/>
+                </ee:message>
+            </ee:transform>
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-that expression="#[payload.BAPI_SALESORDER_CREATEFROMDAT2.tables.ORDER_PARTNERS.row.PARTN_NUMB]"
+                                     is="#[MunitTools::equalTo('0000100234')]" message="ALPHA conversion"/>
+            <munit-tools:assert-that expression="#[payload.BAPI_SALESORDER_CREATEFROMDAT2.tables.ORDER_ITEMS_IN.*row[0].MATERIAL]"
+                                     is="#[MunitTools::equalTo('PMP-CF-200')]" message="material upper-cased"/>
+            <munit-tools:assert-that expression="#[payload.BAPI_SALESORDER_CREATEFROMDAT2.tables.ORDER_ITEMS_IN.*row[0].TARGET_QU]"
+                                     is="#[MunitTools::equalTo('ST')]" message="EA -> ST"/>
+            <munit-tools:assert-that expression="#[payload.BAPI_SALESORDER_CREATEFROMDAT2.tables.ORDER_ITEMS_IN.*row[1].TARGET_QU]"
+                                     is="#[MunitTools::equalTo('KAR')]" message="BOX -> KAR"/>
+            <munit-tools:assert-that expression="#[payload.BAPI_SALESORDER_CREATEFROMDAT2.tables.ORDER_ITEMS_IN.*row[1].ITM_NUMBER]"
+                                     is="#[MunitTools::equalTo('000020')]" message="item number padded"/>
+            <munit-tools:assert-that expression="#[payload.BAPI_SALESORDER_CREATEFROMDAT2.&quot;import&quot;.ORDER_HEADER_IN.REQ_DATE_H]"
+                                     is="#[MunitTools::equalTo('20261120')]" message="SAP date"/>
+            <munit-tools:assert-that expression="#[trim(payload.BAPI_SALESORDER_CREATEFROMDAT2.tables.EXTENSIONIN.row.VALUEPART1)]"
+                                     is="#[MunitTools::equalTo('AIM-20261013-ABCDEF12')]" message="business reference for lookup"/>
+        </munit:validation>
+    </munit:test>
+
+    <!-- ===================================================================================== -->
+    <munit:test name="S2-timeout-then-lookup-finds-order-returns-201"
+                description="SAP committed but answered too late: lookup by reference finds it, 201 recoveredAfterTimeout=true">
+        <munit:behavior>
+            <munit-tools:mock-when processor="http:request" doc:name="Mock SAP create: timeout">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="BAPI_SALESORDER_CREATEFROMDAT2 (mock SAP)"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:error typeId="HTTP:TIMEOUT"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="http:request" doc:name="Mock SAP lookup: found">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="Lookup SAP order by external reference (mock OData)"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value='#[{ found: true, salesOrderNumber: "0000477777", documentCount: 1 }]' mediaType="application/json"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event doc:name="Canonical order">
+                <munit:payload value="#[readUrl('classpath://test-data/canonical-order-for-sap.json', 'application/json')]" mediaType="application/json"/>
+            </munit:set-event>
+            <flow-ref name="sys-sap-create-sales-order-flow" doc:name="Create sales order"/>
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-that expression="#[vars.httpStatus as String]" is="#[MunitTools::equalTo('201')]" message="HTTP status"/>
+            <munit-tools:assert-that expression="#[payload.salesOrderNumber]" is="#[MunitTools::equalTo('0000477777')]" message="recovered SAP number"/>
+            <munit-tools:assert-that expression="#[payload.recoveredAfterTimeout]" is="#[MunitTools::equalTo(true)]" message="flagged as recovered"/>
+            <munit-tools:verify-call processor="http:request" times="1" doc:name="Create attempted only once (no blind retry)">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="BAPI_SALESORDER_CREATEFROMDAT2 (mock SAP)"/>
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <!-- ===================================================================================== -->
+    <munit:test name="S3-timeout-and-lookup-failure-returns-504-unknown"
+                description="Timeout and the lookup also fails: 504 AIM-SAP-5041 (caller must not blind-retry)">
+        <munit:behavior>
+            <munit-tools:mock-when processor="http:request" doc:name="Mock SAP create: timeout">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="BAPI_SALESORDER_CREATEFROMDAT2 (mock SAP)"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:error typeId="HTTP:TIMEOUT"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="http:request" doc:name="Mock SAP lookup: connectivity error">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="Lookup SAP order by external reference (mock OData)"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:error typeId="HTTP:CONNECTIVITY"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event doc:name="Canonical order">
+                <munit:payload value="#[readUrl('classpath://test-data/canonical-order-for-sap.json', 'application/json')]" mediaType="application/json"/>
+            </munit:set-event>
+            <flow-ref name="sys-sap-create-sales-order-flow" doc:name="Create sales order"/>
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-that expression="#[vars.httpStatus as String]" is="#[MunitTools::equalTo('504')]" message="HTTP status"/>
+            <munit-tools:assert-that expression="#[payload.error.code]" is="#[MunitTools::equalTo('AIM-SAP-5041')]" message="error code"/>
+        </munit:validation>
+    </munit:test>
+
+    <!-- ===================================================================================== -->
+    <munit:test name="S4-bapi-return-type-e-returns-422"
+                description="SAP answers 200 but RETURN contains TYPE E: translated to 422 AIM-SAP-4225 with SAP message">
+        <munit:behavior>
+            <munit-tools:mock-when processor="http:request" doc:name="Mock SAP create: RETURN TYPE E">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute attributeName="doc:name" whereValue="BAPI_SALESORDER_CREATEFROMDAT2 (mock SAP)"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[readUrl('classpath://test-data/sap-bapi-reject-response.xml', 'application/xml')]" mediaType="application/xml"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+        </munit:behavior>
+        <munit:execution>
+            <munit:set-event doc:name="Canonical order">
+                <munit:payload value="#[readUrl('classpath://test-data/canonical-order-for-sap.json', 'application/json')]" mediaType="application/json"/>
+            </munit:set-event>
+            <flow-ref name="sys-sap-create-sales-order-flow" doc:name="Create sales order"/>
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-that expression="#[vars.httpStatus as String]" is="#[MunitTools::equalTo('422')]" message="HTTP status"/>
+            <munit-tools:assert-that expression="#[payload.error.code]" is="#[MunitTools::equalTo('AIM-SAP-4225')]" message="error code"/>
+            <munit-tools:assert-that expression="#[payload.error.message contains 'blocked for sales']" is="#[MunitTools::equalTo(true)]" message="SAP message surfaced"/>
+        </munit:validation>
+    </munit:test>
+</mule>

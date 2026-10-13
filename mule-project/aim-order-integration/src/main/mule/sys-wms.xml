@@ -1,0 +1,109 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SYSTEM LAYER: wms-sys-api
+  Anti-corruption layer for the (simulated) StockPoint WMS: WMS speaks sku/qty/onHand, AIM speaks canonical
+  materialNumber/quantity/availableQty. Availability is an idempotent read, so a bounded retry is safe here.
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <!-- POST /sys/wms/v1/availability -->
+    <flow name="sys-wms-availability-flow">
+        <http:listener config-ref="HTTP_Listener_Sys" path="/sys/wms/v1/availability" allowedMethods="POST" doc:name="POST /availability">
+            <http:error-response statusCode="#[vars.httpStatus default 500]">
+                <http:body><![CDATA[#[payload]]]></http:body>
+            </http:error-response>
+        </http:listener>
+        <set-variable variableName="requestLines" value="#[payload.lines]" doc:name="Keep request lines"/>
+        <ee:transform doc:name="Canonical to WMS request">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ warehouse: "DC-US-01", items: vars.requestLines map { sku: $.materialNumber, qty: $.quantity } }]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <!-- Safe: read-only and idempotent. Never wrap creates in until-successful. -->
+        <until-successful maxRetries="2" millisBetweenRetries="300" doc:name="Retry idempotent read (max 2)">
+            <http:request method="POST" config-ref="HTTP_Request_Mock_Backends" path="/mock/wms/availability"
+                          responseTimeout="${timeouts.wmsMs}" doc:name="WMS stock query (mock)">
+                <http:headers><![CDATA[#[{ 'x-correlation-id': correlationId }]]]></http:headers>
+            </http:request>
+        </until-successful>
+        <ee:transform doc:name="WMS response to canonical availability">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var bySku = payload.items groupBy $.sku
+---
+{
+  location: payload.warehouse,
+  lines: vars.requestLines map (l) -> do {
+    var item = bySku[l.materialNumber][0]
+    ---
+    {
+      lineNumber: l.lineNumber,
+      materialNumber: l.materialNumber,
+      known: item.known default false,
+      availableQty: if (item.known default false) max([0, item.onHand - item.reserved]) else 0
+    }
+  }
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- POST /sys/wms/v1/reservations -->
+    <flow name="sys-wms-create-reservation-flow">
+        <http:listener config-ref="HTTP_Listener_Sys" path="/sys/wms/v1/reservations" allowedMethods="POST" doc:name="POST /reservations">
+            <http:response statusCode="201"/>
+            <http:error-response statusCode="#[vars.httpStatus default 500]">
+                <http:body><![CDATA[#[payload]]]></http:body>
+            </http:error-response>
+        </http:listener>
+        <ee:transform doc:name="Canonical to WMS reservation">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  externalReference: payload.reference,
+  expiresInMinutes: payload.ttlMinutes,
+  items: payload.lines map { sku: $.materialNumber, qty: $.quantity }
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <http:request method="POST" config-ref="HTTP_Request_Mock_Backends" path="/mock/wms/reservations"
+                      responseTimeout="${timeouts.wmsMs}" doc:name="WMS create reservation (mock)">
+            <http:headers><![CDATA[#[{ 'x-correlation-id': correlationId }]]]></http:headers>
+        </http:request>
+        <ee:transform doc:name="WMS reservation to canonical">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ reservationId: payload.reservationNo, expiresAt: payload.expiresAt }]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- DELETE /sys/wms/v1/reservations/{reservationId}  (saga compensation; idempotent) -->
+    <flow name="sys-wms-release-reservation-flow">
+        <http:listener config-ref="HTTP_Listener_Sys" path="/sys/wms/v1/reservations/{reservationId}" allowedMethods="DELETE" doc:name="DELETE /reservations/{id}">
+            <http:error-response statusCode="#[vars.httpStatus default 500]">
+                <http:body><![CDATA[#[payload]]]></http:body>
+            </http:error-response>
+        </http:listener>
+        <http:request method="DELETE" config-ref="HTTP_Request_Mock_Backends" path="/mock/wms/reservations/{id}"
+                      responseTimeout="${timeouts.wmsMs}" doc:name="WMS release reservation (mock)">
+            <http:headers><![CDATA[#[{ 'x-correlation-id': correlationId }]]]></http:headers>
+            <http:uri-params><![CDATA[#[{ id: attributes.uriParams.reservationId }]]]></http:uri-params>
+        </http:request>
+    </flow>
+</mule>

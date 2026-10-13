@@ -1,0 +1,402 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  PROCESS LAYER: order-mgmt-prc-api  (the order saga)
+  1. Claim idempotency key (DB unique insert)        -> replay / 409 / 422 on duplicates
+  2. Validate customer + availability in parallel    -> scatter-gather
+  3. Allocate stock (DataWeave)                       -> FULL / PARTIAL / NONE
+  4. Soft-reserve stock in WMS (TTL)
+  5. Create SAP order via SAP System API              -> CREATED / REJECTED (compensate) / UNKNOWN (PENDING_ERP, 202)
+  6. ONE local DB transaction: order_state + outbox events + idempotency COMPLETED
+  7. Respond 201 / 202 (persist-then-respond)
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:db="http://www.mulesoft.org/schema/mule/db"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd">
+
+    <!-- ===================== HTTP interface ===================== -->
+    <flow name="prc-order-api-post-orders-flow">
+        <http:listener config-ref="HTTP_Listener_Prc" path="/prc/order-mgmt/v1/orders" allowedMethods="POST" doc:name="POST /orders">
+            <http:response statusCode="#[vars.httpStatus default 200]">
+                <http:headers><![CDATA[#[vars.outboundHeaders default {}]]]></http:headers>
+            </http:response>
+            <http:error-response statusCode="#[vars.httpStatus default 500]">
+                <http:body><![CDATA[#[payload]]]></http:body>
+            </http:error-response>
+        </http:listener>
+        <flow-ref name="prc-create-order-flow" doc:name="Create order"/>
+    </flow>
+
+    <flow name="prc-order-api-get-order-flow">
+        <http:listener config-ref="HTTP_Listener_Prc" path="/prc/order-mgmt/v1/orders/{orderId}" allowedMethods="GET" doc:name="GET /orders/{orderId}">
+            <http:response statusCode="#[vars.httpStatus default 200]"/>
+            <http:error-response statusCode="#[vars.httpStatus default 500]">
+                <http:body><![CDATA[#[payload]]]></http:body>
+            </http:error-response>
+        </http:listener>
+        <db:select config-ref="Database_Config" doc:name="Select order state">
+            <db:sql><![CDATA[SELECT order_id, external_order_id, status, sap_order_number, lines_json, updated_at
+                             FROM order_state WHERE order_id = :orderId]]></db:sql>
+            <db:input-parameters><![CDATA[#[{ orderId: attributes.uriParams.orderId }]]]></db:input-parameters>
+        </db:select>
+        <choice doc:name="Found?">
+            <when expression="#[isEmpty(payload)]">
+                <raise-error type="AIM:ORDER_NOT_FOUND" description="Order not found"/>
+            </when>
+        </choice>
+        <ee:transform doc:name="Order state to API response">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var row = payload[0]
+---
+{
+  orderId: row.order_id,
+  externalOrderId: row.external_order_id,
+  status: row.status,
+  (sapOrderNumber: row.sap_order_number) if (row.sap_order_number != null),
+  lines: if (row.lines_json != null)
+           read(row.lines_json, "application/json") map {
+             lineNumber: $.lineNumber, materialNumber: $.materialNumber,
+             reservedQty: $.reservedQty, backorderedQty: $.backorderedQty }
+         else [],
+  lastUpdated: row.updated_at as String
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- ===================== Orchestration ===================== -->
+    <flow name="prc-create-order-flow">
+        <ee:transform doc:name="Initialise order context">
+            <ee:variables>
+                <ee:set-variable variableName="order"><![CDATA[%dw 2.0
+output application/java
+---
+payload]]></ee:set-variable>
+                <ee:set-variable variableName="idempotencyKey"><![CDATA[%dw 2.0
+output application/java
+---
+(attributes.headers."idempotency-key" default "") as String]]></ee:set-variable>
+                <ee:set-variable variableName="requestHash"><![CDATA[%dw 2.0
+import dw::Crypto
+output application/java
+---
+Crypto::SHA1(write(payload, "application/json") as Binary)]]></ee:set-variable>
+                <ee:set-variable variableName="orderId"><![CDATA[%dw 2.0
+output application/java
+---
+"AIM-" ++ (now() as String { format: "yyyyMMdd" }) ++ "-" ++ upper((uuid() replace "-" with "")[0 to 7])]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+        <choice doc:name="Idempotency-Key present?">
+            <when expression="#[isEmpty(vars.idempotencyKey)]">
+                <raise-error type="AIM:BAD_REQUEST" description="Header Idempotency-Key is required"/>
+            </when>
+        </choice>
+        <flow-ref name="prc-claim-idempotency-subflow" doc:name="Claim idempotency key"/>
+        <choice doc:name="Replay stored response or process?">
+            <when expression="#[vars.replay]">
+                <logger level="INFO" category="aim.order" doc:name="Log replay"
+                        message="#['IDEMPOTENT_REPLAY key=' ++ vars.idempotencyKey ++ ' httpStatus=' ++ (vars.httpStatus as String)]"/>
+            </when>
+            <otherwise>
+                <flow-ref name="prc-process-new-order-flow" doc:name="Process new order"/>
+            </otherwise>
+        </choice>
+    </flow>
+
+    <!-- Atomic claim: the PRIMARY KEY guarantees only one request with a given key proceeds -->
+    <sub-flow name="prc-claim-idempotency-subflow">
+        <set-variable variableName="replay" value="#[false]" doc:name="replay = false"/>
+        <try doc:name="Try to claim key">
+            <db:insert config-ref="Database_Config" doc:name="Insert idempotency record (IN_PROGRESS)">
+                <db:sql><![CDATA[INSERT INTO idempotency_record (idempotency_key, request_hash, status)
+                                 VALUES (:k, :h, 'IN_PROGRESS')]]></db:sql>
+                <db:input-parameters><![CDATA[#[{ k: vars.idempotencyKey, h: vars.requestHash }]]]></db:input-parameters>
+            </db:insert>
+            <error-handler>
+                <on-error-continue type="DB:QUERY_EXECUTION" logException="false" doc:name="Key already exists">
+                    <db:select config-ref="Database_Config" doc:name="Load existing idempotency record">
+                        <db:sql><![CDATA[SELECT request_hash, status, http_status, response_body
+                                         FROM idempotency_record WHERE idempotency_key = :k]]></db:sql>
+                        <db:input-parameters><![CDATA[#[{ k: vars.idempotencyKey }]]]></db:input-parameters>
+                    </db:select>
+                    <set-variable variableName="existing" value="#[payload[0]]" doc:name="existing"/>
+                    <choice doc:name="Same request? Completed?">
+                        <when expression="#[vars.existing.request_hash != vars.requestHash]">
+                            <raise-error type="AIM:IDEMPOTENCY_KEY_REUSED" description="Idempotency-Key was already used with a different request body"/>
+                        </when>
+                        <when expression="#[vars.existing.status == 'COMPLETED']">
+                            <set-variable variableName="replay" value="#[true]" doc:name="replay = true"/>
+                            <set-variable variableName="httpStatus" value="#[vars.existing.http_status]" doc:name="Stored status"/>
+                            <set-variable variableName="outboundHeaders" value="#[{ 'idempotent-replayed': 'true' }]" doc:name="Replay header"/>
+                            <ee:transform doc:name="Stored response">
+                                <ee:message>
+                                    <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+read(vars.existing.response_body, "application/json")]]></ee:set-payload>
+                                </ee:message>
+                            </ee:transform>
+                        </when>
+                        <otherwise>
+                            <raise-error type="AIM:DUPLICATE_IN_PROGRESS" description="A request with this Idempotency-Key is still being processed. Retry later with the same key."/>
+                        </otherwise>
+                    </choice>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </sub-flow>
+
+    <!-- Private flow: own error handler releases the idempotency claim on failure so the client can retry -->
+    <flow name="prc-process-new-order-flow">
+        <!-- Step 2: independent checks in parallel; latency = slowest route, not the sum -->
+        <scatter-gather timeout="${timeouts.scatterGatherMs}" doc:name="Validate customer and availability in parallel">
+            <route>
+                <try doc:name="Customer lookup (404 is a business outcome)">
+                    <http:request method="GET" config-ref="HTTP_Request_Sys_CRM" path="/sys/crm/v1/accounts/{customerId}"
+                                  responseTimeout="${timeouts.crmMs}" doc:name="Get customer from CRM System API">
+                        <http:headers><![CDATA[#[{ 'x-correlation-id': correlationId }]]]></http:headers>
+                        <http:uri-params><![CDATA[#[{ customerId: vars.order.customerId }]]]></http:uri-params>
+                    </http:request>
+                    <error-handler>
+                        <on-error-continue type="HTTP:NOT_FOUND" logException="false" doc:name="Unknown customer">
+                            <ee:transform doc:name="Customer not found">
+                                <ee:message>
+                                    <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ customerId: vars.order.customerId, status: "NOT_FOUND" }]]></ee:set-payload>
+                                </ee:message>
+                            </ee:transform>
+                        </on-error-continue>
+                    </error-handler>
+                </try>
+            </route>
+            <route>
+                <http:request method="POST" config-ref="HTTP_Request_Sys_WMS" path="/sys/wms/v1/availability"
+                              responseTimeout="${timeouts.wmsMs}" doc:name="Check availability in WMS System API">
+                    <http:body><![CDATA[#[output application/json --- {
+                        lines: vars.order.lines map { lineNumber: $.lineNumber, materialNumber: $.materialNumber, quantity: $.quantity }
+                    }]]]></http:body>
+                    <http:headers><![CDATA[#[{ 'x-correlation-id': correlationId }]]]></http:headers>
+                </http:request>
+            </route>
+        </scatter-gather>
+
+        <!-- Step 3: merge results and allocate -->
+        <ee:transform doc:name="Merge validation results and allocate stock">
+            <ee:variables>
+                <ee:set-variable variableName="customer"><![CDATA[%dw 2.0
+output application/java
+---
+payload."0".payload]]></ee:set-variable>
+                <ee:set-variable variableName="allocation" resource="dwl/allocation.dwl"/>
+            </ee:variables>
+        </ee:transform>
+        <choice doc:name="Customer orderable?">
+            <when expression="#[vars.customer.status != 'ACTIVE']">
+                <raise-error type="AIM:CUSTOMER_INVALID"
+                             description="#['Customer ' ++ vars.order.customerId ++ ' is not orderable (status ' ++ (vars.customer.status default 'UNKNOWN') ++ ')']"/>
+            </when>
+        </choice>
+        <choice doc:name="All materials known?">
+            <when expression="#[not isEmpty(vars.allocation.unknownMaterials)]">
+                <raise-error type="AIM:MATERIAL_INVALID"
+                             description="#['Unknown materials: ' ++ (vars.allocation.unknownMaterials joinBy ', ')]"/>
+            </when>
+        </choice>
+
+        <!-- Step 4: soft reservation with TTL (self-healing if the saga dies) -->
+        <choice doc:name="Anything to reserve?">
+            <when expression="#[vars.allocation.status != 'NONE']">
+                <http:request method="POST" config-ref="HTTP_Request_Sys_WMS" path="/sys/wms/v1/reservations"
+                              responseTimeout="${timeouts.wmsMs}" doc:name="Create soft reservation in WMS System API">
+                    <http:body><![CDATA[#[output application/json --- {
+                        reference: vars.orderId,
+                        ttlMinutes: p('order.reservationTtlMinutes') as Number,
+                        lines: (vars.allocation.lines filter ($.reservedQty > 0)) map { materialNumber: $.materialNumber, quantity: $.reservedQty }
+                    }]]]></http:body>
+                    <http:headers><![CDATA[#[{ 'x-correlation-id': correlationId }]]]></http:headers>
+                </http:request>
+                <set-variable variableName="reservationId" value="#[payload.reservationId]" doc:name="reservationId"/>
+            </when>
+            <otherwise>
+                <set-variable variableName="reservationId" value="#[null]" doc:name="No reservation"/>
+            </otherwise>
+        </choice>
+
+        <!-- Step 5: SAP order. Timeout/unreachable = UNKNOWN outcome, never a blind retry -->
+        <try doc:name="Create SAP order (unknown-outcome aware)">
+            <http:request method="POST" config-ref="HTTP_Request_Sys_SAP" path="/sys/sap/v1/sales-orders"
+                          responseTimeout="${timeouts.sapSysMs}" doc:name="Create SAP sales order">
+                <http:body><![CDATA[#[output application/json --- vars.order ++ { orderId: vars.orderId }]]]></http:body>
+                <http:headers><![CDATA[#[{ 'x-correlation-id': correlationId }]]]></http:headers>
+                <http:response-validator>
+                    <http:success-status-code-validator values="200..599"/>
+                </http:response-validator>
+            </http:request>
+            <ee:transform doc:name="Interpret SAP System API response">
+                <ee:variables>
+                    <ee:set-variable variableName="erpOutcome"><![CDATA[%dw 2.0
+output application/java
+---
+attributes.statusCode match {
+  case 201 -> "CREATED"
+  case 200 -> "CREATED"
+  case 422 -> "REJECTED"
+  else -> "UNKNOWN"
+}]]></ee:set-variable>
+                    <ee:set-variable variableName="sapResult"><![CDATA[%dw 2.0
+output application/java
+---
+payload]]></ee:set-variable>
+                </ee:variables>
+            </ee:transform>
+            <error-handler>
+                <on-error-continue type="HTTP:TIMEOUT, HTTP:CONNECTIVITY" doc:name="SAP System API slow or unreachable">
+                    <set-variable variableName="erpOutcome" value="UNKNOWN" doc:name="erpOutcome = UNKNOWN"/>
+                    <set-variable variableName="sapResult" value="#[{}]" doc:name="sapResult = {}"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+        <choice doc:name="Route by ERP outcome">
+            <when expression="#[vars.erpOutcome == 'REJECTED']">
+                <flow-ref name="prc-compensate-release-reservation-flow" doc:name="Compensate: release reservation"/>
+                <raise-error type="AIM:SAP_BUSINESS_ERROR"
+                             description="#['SAP rejected the order: ' ++ (vars.sapResult.error.message default 'no details')]"/>
+            </when>
+            <when expression="#[vars.erpOutcome == 'UNKNOWN']">
+                <set-variable variableName="orderStatus" value="PENDING_ERP" doc:name="PENDING_ERP"/>
+                <set-variable variableName="httpStatus" value="#[202]" doc:name="202"/>
+                <set-variable variableName="sapOrderNumber" value="#[null]" doc:name="No SAP number yet"/>
+            </when>
+            <otherwise>
+                <set-variable variableName="orderStatus" value="#[if (vars.allocation.status == 'FULL') 'CONFIRMED' else 'BACKORDERED']" doc:name="CONFIRMED or BACKORDERED"/>
+                <set-variable variableName="httpStatus" value="#[201]" doc:name="201"/>
+                <set-variable variableName="sapOrderNumber" value="#[vars.sapResult.salesOrderNumber]" doc:name="SAP number"/>
+            </otherwise>
+        </choice>
+
+        <!-- Step 6: response + events, then ONE local transaction (transactional outbox) -->
+        <ee:transform doc:name="Build response and outbox events">
+            <ee:variables>
+                <ee:set-variable variableName="response"><![CDATA[%dw 2.0
+output application/java
+---
+{
+  orderId: vars.orderId,
+  externalOrderId: vars.order.externalOrderId,
+  status: vars.orderStatus,
+  (sapOrderNumber: vars.sapOrderNumber) if (vars.sapOrderNumber != null),
+  (recoveredAfterSapTimeout: true) if (vars.sapResult.recoveredAfterTimeout default false),
+  lines: vars.allocation.lines map {
+    lineNumber: $.lineNumber, materialNumber: $.materialNumber,
+    reservedQty: $.reservedQty, backorderedQty: $.backorderedQty },
+  (message: "Order accepted. ERP confirmation pending.") if (vars.orderStatus == "PENDING_ERP")
+}]]></ee:set-variable>
+                <ee:set-variable variableName="events" resource="dwl/order-events.dwl"/>
+            </ee:variables>
+        </ee:transform>
+        <try transactionalAction="ALWAYS_BEGIN" doc:name="TX: order state + outbox + idempotency">
+            <db:insert config-ref="Database_Config" doc:name="Insert order state">
+                <db:sql><![CDATA[INSERT INTO order_state (order_id, external_order_id, customer_id, status, sap_order_number,
+                                 reservation_id, order_json, lines_json)
+                                 VALUES (:orderId, :externalOrderId, :customerId, :status, :sapOrderNumber,
+                                 :reservationId, :orderJson, :linesJson)]]></db:sql>
+                <db:input-parameters><![CDATA[#[{
+                    orderId: vars.orderId,
+                    externalOrderId: vars.order.externalOrderId,
+                    customerId: vars.order.customerId,
+                    status: vars.orderStatus,
+                    sapOrderNumber: vars.sapOrderNumber,
+                    reservationId: vars.reservationId,
+                    orderJson: write(vars.order, "application/json"),
+                    linesJson: write(vars.allocation.lines, "application/json")
+                }]]]></db:input-parameters>
+            </db:insert>
+            <foreach collection="#[vars.events]" doc:name="For each event">
+                <db:insert config-ref="Database_Config" doc:name="Insert outbox event">
+                    <db:sql><![CDATA[INSERT INTO outbox_event (event_id, aggregate_id, event_type, payload)
+                                     VALUES (:eventId, :aggregateId, :eventType, :payload)]]></db:sql>
+                    <db:input-parameters><![CDATA[#[{
+                        eventId: payload.eventId,
+                        aggregateId: vars.orderId,
+                        eventType: payload.eventType,
+                        payload: write(payload, "application/json")
+                    }]]]></db:input-parameters>
+                </db:insert>
+            </foreach>
+            <db:update config-ref="Database_Config" doc:name="Complete idempotency record">
+                <db:sql><![CDATA[UPDATE idempotency_record
+                                 SET status = 'COMPLETED', http_status = :httpStatus, response_body = :body, updated_at = CURRENT_TIMESTAMP
+                                 WHERE idempotency_key = :k]]></db:sql>
+                <db:input-parameters><![CDATA[#[{
+                    httpStatus: vars.httpStatus,
+                    body: write(vars.response, "application/json"),
+                    k: vars.idempotencyKey
+                }]]]></db:input-parameters>
+            </db:update>
+        </try>
+
+        <!-- Step 7: respond only after the commit -->
+        <ee:transform doc:name="Response payload">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+vars.response]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <logger level="INFO" category="aim.order" doc:name="Log order processed"
+                message="#['ORDER_PROCESSED orderId=' ++ vars.orderId ++ ' status=' ++ vars.orderStatus ++ ' sapOrder=' ++ (vars.sapOrderNumber default '-') ++ ' events=' ++ (sizeOf(vars.events) as String)]"/>
+
+        <error-handler>
+            <on-error-propagate type="ANY" doc:name="Release idempotency claim, then propagate">
+                <try doc:name="Best-effort key release">
+                    <db:delete config-ref="Database_Config" doc:name="Delete IN_PROGRESS idempotency record">
+                        <db:sql><![CDATA[DELETE FROM idempotency_record WHERE idempotency_key = :k AND status = 'IN_PROGRESS']]></db:sql>
+                        <db:input-parameters><![CDATA[#[{ k: vars.idempotencyKey }]]]></db:input-parameters>
+                    </db:delete>
+                    <error-handler>
+                        <on-error-continue type="ANY" doc:name="Could not release key">
+                            <logger level="ERROR" category="aim.order" doc:name="Log release failure"
+                                    message="#['Could not release idempotency key ' ++ vars.idempotencyKey ++ '; a sweeper/lookup will resolve it']"/>
+                        </on-error-continue>
+                    </error-handler>
+                </try>
+            </on-error-propagate>
+        </error-handler>
+    </flow>
+
+    <!-- Saga compensation: only for DEFINITIVE failures. A failed compensation is logged and the WMS TTL frees the stock. -->
+    <flow name="prc-compensate-release-reservation-flow">
+        <choice doc:name="Reservation exists?">
+            <when expression="#[vars.reservationId != null]">
+                <try doc:name="Release reservation">
+                    <http:request method="DELETE" config-ref="HTTP_Request_Sys_WMS" path="/sys/wms/v1/reservations/{reservationId}"
+                                  responseTimeout="${timeouts.wmsMs}" doc:name="Release reservation in WMS System API">
+                        <http:headers><![CDATA[#[{ 'x-correlation-id': correlationId }]]]></http:headers>
+                        <http:uri-params><![CDATA[#[{ reservationId: vars.reservationId }]]]></http:uri-params>
+                    </http:request>
+                    <logger level="INFO" category="aim.order" doc:name="Log compensation"
+                            message="#['COMPENSATED reservation=' ++ vars.reservationId ++ ' orderId=' ++ vars.orderId]"/>
+                    <error-handler>
+                        <on-error-continue type="ANY" doc:name="Compensation failed">
+                            <!-- Production: publish reservation.release-required to a retry queue (with DLQ) -->
+                            <logger level="ERROR" category="aim.order" doc:name="Log compensation failure"
+                                    message="#['COMPENSATION_FAILED reservation=' ++ vars.reservationId ++ '; TTL will release it']"/>
+                        </on-error-continue>
+                    </error-handler>
+                </try>
+            </when>
+        </choice>
+    </flow>
+</mule>

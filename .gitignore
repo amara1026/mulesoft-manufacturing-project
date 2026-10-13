@@ -1,0 +1,22 @@
+# Maven / Mule build output
+target/
+.mule/
+*.jar
+
+# Anypoint Studio / Eclipse / IDE
+.classpath
+.project
+.settings/
+.idea/
+*.iml
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local secrets (never commit)
+*.p12
+*.jks
+secure-*.yaml
+settings.xml

@@ -1,0 +1,197 @@
+{
+  "info": {
+    "name": "AIM Order Integration (training project)",
+    "description": "Scenarios for the simulated manufacturing order platform. Run the Mule app in Anypoint Studio first (ports 8081/8082/8091).",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "exp", "value": "http://localhost:8081/api" },
+    { "key": "prc", "value": "http://localhost:8082/prc" },
+    { "key": "mock", "value": "http://localhost:8091/mock" },
+    { "key": "orderId", "value": "" },
+    { "key": "dupKey", "value": "DEMO-DUP-KEY-0001" }
+  ],
+  "item": [
+    {
+      "name": "01 Submit order - in stock (201 CONFIRMED)",
+      "event": [{ "listen": "test", "script": { "exec": [
+        "pm.test('201 CONFIRMED', () => { pm.response.to.have.status(201); pm.expect(pm.response.json().status).to.eql('CONFIRMED'); });",
+        "pm.test('correlation id echoed', () => pm.expect(pm.response.headers.get('x-correlation-id')).to.exist);",
+        "pm.collectionVariables.set('orderId', pm.response.json().orderId);"
+      ] } }],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Idempotency-Key", "value": "DEMO-{{$guid}}" }
+        ],
+        "url": "{{exp}}/v1/orders",
+        "body": { "mode": "raw", "raw": "{\n  \"externalOrderId\": \"SF-00012345\",\n  \"sourceSystem\": \"SALESFORCE\",\n  \"customerId\": \"CUST-100234\",\n  \"customerPoNumber\": \"WU-PO-77812\",\n  \"currency\": \"USD\",\n  \"requestedDeliveryDate\": \"2026-11-20\",\n  \"shipTo\": { \"name\": \"Riverside Water Utility\", \"line1\": \"100 River Rd\", \"city\": \"Austin\", \"postalCode\": \"73301\", \"country\": \"US\" },\n  \"lines\": [ { \"lineNumber\": 10, \"materialNumber\": \"PMP-CF-200\", \"quantity\": 5, \"unitOfMeasure\": \"EA\" } ]\n}" }
+      }
+    },
+    {
+      "name": "02 Get order status",
+      "request": { "method": "GET", "url": "{{exp}}/v1/orders/{{orderId}}" }
+    },
+    {
+      "name": "03 Submit order - shortage (201 BACKORDERED + requisition)",
+      "event": [{ "listen": "test", "script": { "exec": [
+        "pm.test('201 BACKORDERED', () => { pm.response.to.have.status(201); pm.expect(pm.response.json().status).to.eql('BACKORDERED'); });",
+        "pm.collectionVariables.set('orderId', pm.response.json().orderId);"
+      ] } }],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Idempotency-Key", "value": "DEMO-{{$guid}}" }
+        ],
+        "url": "{{exp}}/v1/orders",
+        "body": { "mode": "raw", "raw": "{\n  \"externalOrderId\": \"SF-00012346\",\n  \"sourceSystem\": \"SALESFORCE\",\n  \"customerId\": \"CUST-100234\",\n  \"customerPoNumber\": \"WU-PO-77813\",\n  \"currency\": \"USD\",\n  \"requestedDeliveryDate\": \"2026-11-20\",\n  \"shipTo\": { \"name\": \"Riverside Water Utility\", \"line1\": \"100 River Rd\", \"city\": \"Austin\", \"postalCode\": \"73301\", \"country\": \"US\" },\n  \"lines\": [\n    { \"lineNumber\": 10, \"materialNumber\": \"PMP-CF-200\", \"quantity\": 5, \"unitOfMeasure\": \"EA\" },\n    { \"lineNumber\": 20, \"materialNumber\": \"VLV-BL-050\", \"quantity\": 40, \"unitOfMeasure\": \"EA\" }\n  ]\n}" }
+      }
+    },
+    {
+      "name": "04 Duplicate submit - send twice (2nd = replay, same orderId)",
+      "event": [{ "listen": "test", "script": { "exec": [
+        "pm.test('2xx', () => pm.expect(pm.response.code).to.be.oneOf([201, 202]));",
+        "console.log('idempotent-replayed header:', pm.response.headers.get('idempotent-replayed'));"
+      ] } }],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Idempotency-Key", "value": "{{dupKey}}" }
+        ],
+        "url": "{{exp}}/v1/orders",
+        "body": { "mode": "raw", "raw": "{\n  \"externalOrderId\": \"SF-00012400\",\n  \"sourceSystem\": \"SALESFORCE\",\n  \"customerId\": \"CUST-200500\",\n  \"customerPoNumber\": \"GC-PO-1001\",\n  \"currency\": \"USD\",\n  \"requestedDeliveryDate\": \"2026-11-25\",\n  \"shipTo\": { \"name\": \"Gulf Coast Chemicals\", \"line1\": \"1 Refinery Way\", \"city\": \"Houston\", \"postalCode\": \"77001\", \"country\": \"US\" },\n  \"lines\": [ { \"lineNumber\": 10, \"materialNumber\": \"SEAL-MECH-40\", \"quantity\": 20, \"unitOfMeasure\": \"EA\" } ]\n}" }
+      }
+    },
+    {
+      "name": "05 Same key, different body (422 AIM-ORD-4221)",
+      "event": [{ "listen": "test", "script": { "exec": [
+        "pm.test('422 key reused', () => { pm.response.to.have.status(422); pm.expect(pm.response.json().error.code).to.eql('AIM-ORD-4221'); });"
+      ] } }],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Idempotency-Key", "value": "{{dupKey}}" }
+        ],
+        "url": "{{exp}}/v1/orders",
+        "body": { "mode": "raw", "raw": "{\n  \"externalOrderId\": \"SF-00012400\",\n  \"sourceSystem\": \"SALESFORCE\",\n  \"customerId\": \"CUST-200500\",\n  \"customerPoNumber\": \"GC-PO-1001\",\n  \"currency\": \"USD\",\n  \"requestedDeliveryDate\": \"2026-11-25\",\n  \"shipTo\": { \"name\": \"Gulf Coast Chemicals\", \"line1\": \"1 Refinery Way\", \"city\": \"Houston\", \"postalCode\": \"77001\", \"country\": \"US\" },\n  \"lines\": [ { \"lineNumber\": 10, \"materialNumber\": \"SEAL-MECH-40\", \"quantity\": 99, \"unitOfMeasure\": \"EA\" } ]\n}" }
+      }
+    },
+    {
+      "name": "06 Customer credit-blocked (422 AIM-ORD-4223)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Idempotency-Key", "value": "DEMO-{{$guid}}" }
+        ],
+        "url": "{{exp}}/v1/orders",
+        "body": { "mode": "raw", "raw": "{\n  \"externalOrderId\": \"SF-00012500\",\n  \"sourceSystem\": \"SALESFORCE\",\n  \"customerId\": \"CUST-BLOCKED\",\n  \"customerPoNumber\": \"OI-PO-1\",\n  \"currency\": \"USD\",\n  \"requestedDeliveryDate\": \"2026-11-25\",\n  \"shipTo\": { \"name\": \"Overdue Industries\", \"line1\": \"9 Late St\", \"city\": \"Dallas\", \"postalCode\": \"75001\", \"country\": \"US\" },\n  \"lines\": [ { \"lineNumber\": 10, \"materialNumber\": \"PMP-CF-200\", \"quantity\": 1, \"unitOfMeasure\": \"EA\" } ]\n}" }
+      }
+    },
+    {
+      "name": "07 Unknown material (422 AIM-ORD-4224)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Idempotency-Key", "value": "DEMO-{{$guid}}" }
+        ],
+        "url": "{{exp}}/v1/orders",
+        "body": { "mode": "raw", "raw": "{\n  \"externalOrderId\": \"SF-00012600\",\n  \"sourceSystem\": \"SALESFORCE\",\n  \"customerId\": \"CUST-100234\",\n  \"customerPoNumber\": \"WU-PO-9\",\n  \"currency\": \"USD\",\n  \"requestedDeliveryDate\": \"2026-11-25\",\n  \"shipTo\": { \"name\": \"Riverside Water Utility\", \"line1\": \"100 River Rd\", \"city\": \"Austin\", \"postalCode\": \"73301\", \"country\": \"US\" },\n  \"lines\": [ { \"lineNumber\": 10, \"materialNumber\": \"XYZ-UNKNOWN\", \"quantity\": 1, \"unitOfMeasure\": \"EA\" } ]\n}" }
+      }
+    },
+    {
+      "name": "08 SAP commits but times out (201, recoveredAfterSapTimeout)",
+      "event": [{ "listen": "test", "script": { "exec": [
+        "pm.test('201 recovered', () => { pm.response.to.have.status(201); pm.expect(pm.response.json().recoveredAfterSapTimeout).to.eql(true); });",
+        "pm.collectionVariables.set('orderId', pm.response.json().orderId);"
+      ] } }],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Idempotency-Key", "value": "DEMO-{{$guid}}" }
+        ],
+        "url": "{{exp}}/v1/orders",
+        "body": { "mode": "raw", "raw": "{\n  \"externalOrderId\": \"SF-00012700\",\n  \"sourceSystem\": \"SALESFORCE\",\n  \"customerId\": \"CUST-100234\",\n  \"customerPoNumber\": \"TIMEOUT-WU-1\",\n  \"currency\": \"USD\",\n  \"requestedDeliveryDate\": \"2026-11-25\",\n  \"shipTo\": { \"name\": \"Riverside Water Utility\", \"line1\": \"100 River Rd\", \"city\": \"Austin\", \"postalCode\": \"73301\", \"country\": \"US\" },\n  \"lines\": [ { \"lineNumber\": 10, \"materialNumber\": \"PMP-CF-200\", \"quantity\": 1, \"unitOfMeasure\": \"EA\" } ]\n}" }
+      }
+    },
+    {
+      "name": "09 Mock SAP: documents for last order (documentCount must be 1)",
+      "request": { "method": "GET", "url": "{{mock}}/sap/sales-orders?externalRef={{orderId}}" }
+    },
+    {
+      "name": "10 SAP down once (202 PENDING_ERP, then re-run 02 after ~10 s)",
+      "event": [{ "listen": "test", "script": { "exec": [
+        "pm.test('202 pending', () => { pm.response.to.have.status(202); pm.expect(pm.response.json().status).to.eql('PENDING_ERP'); });",
+        "pm.collectionVariables.set('orderId', pm.response.json().orderId);"
+      ] } }],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Idempotency-Key", "value": "DEMO-{{$guid}}" }
+        ],
+        "url": "{{exp}}/v1/orders",
+        "body": { "mode": "raw", "raw": "{\n  \"externalOrderId\": \"SF-00012800\",\n  \"sourceSystem\": \"SALESFORCE\",\n  \"customerId\": \"CUST-100234\",\n  \"customerPoNumber\": \"SAPDOWN-WU-1\",\n  \"currency\": \"USD\",\n  \"requestedDeliveryDate\": \"2026-11-25\",\n  \"shipTo\": { \"name\": \"Riverside Water Utility\", \"line1\": \"100 River Rd\", \"city\": \"Austin\", \"postalCode\": \"73301\", \"country\": \"US\" },\n  \"lines\": [ { \"lineNumber\": 10, \"materialNumber\": \"PMP-CF-200\", \"quantity\": 1, \"unitOfMeasure\": \"EA\" } ]\n}" }
+      }
+    },
+    {
+      "name": "11 SAP rejects - credit block (422 + reservation released)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Idempotency-Key", "value": "DEMO-{{$guid}}" }
+        ],
+        "url": "{{exp}}/v1/orders",
+        "body": { "mode": "raw", "raw": "{\n  \"externalOrderId\": \"SF-00012900\",\n  \"sourceSystem\": \"SALESFORCE\",\n  \"customerId\": \"CUST-100234\",\n  \"customerPoNumber\": \"REJECT-WU-1\",\n  \"currency\": \"USD\",\n  \"requestedDeliveryDate\": \"2026-11-25\",\n  \"shipTo\": { \"name\": \"Riverside Water Utility\", \"line1\": \"100 River Rd\", \"city\": \"Austin\", \"postalCode\": \"73301\", \"country\": \"US\" },\n  \"lines\": [ { \"lineNumber\": 10, \"materialNumber\": \"PMP-CF-200\", \"quantity\": 1, \"unitOfMeasure\": \"EA\" } ]\n}" }
+      }
+    },
+    {
+      "name": "12 Missing Idempotency-Key (400 from APIkit)",
+      "request": {
+        "method": "POST",
+        "header": [ { "key": "Content-Type", "value": "application/json" } ],
+        "url": "{{exp}}/v1/orders",
+        "body": { "mode": "raw", "raw": "{\n  \"externalOrderId\": \"SF-00013000\",\n  \"sourceSystem\": \"SALESFORCE\",\n  \"customerId\": \"CUST-100234\",\n  \"currency\": \"USD\",\n  \"requestedDeliveryDate\": \"2026-11-25\",\n  \"shipTo\": { \"name\": \"Riverside Water Utility\", \"line1\": \"100 River Rd\", \"city\": \"Austin\", \"postalCode\": \"73301\", \"country\": \"US\" },\n  \"lines\": [ { \"lineNumber\": 10, \"materialNumber\": \"PMP-CF-200\", \"quantity\": 1, \"unitOfMeasure\": \"EA\" } ]\n}" }
+      }
+    },
+    {
+      "name": "13 Supplier outage -> DLQ (order with MTR-7.5KW, wait ~15 s, then 14)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Idempotency-Key", "value": "DEMO-{{$guid}}" }
+        ],
+        "url": "{{exp}}/v1/orders",
+        "body": { "mode": "raw", "raw": "{\n  \"externalOrderId\": \"SF-00013100\",\n  \"sourceSystem\": \"SALESFORCE\",\n  \"customerId\": \"CUST-200500\",\n  \"customerPoNumber\": \"GC-PO-2001\",\n  \"currency\": \"USD\",\n  \"requestedDeliveryDate\": \"2026-12-01\",\n  \"shipTo\": { \"name\": \"Gulf Coast Chemicals\", \"line1\": \"1 Refinery Way\", \"city\": \"Houston\", \"postalCode\": \"77001\", \"country\": \"US\" },\n  \"lines\": [ { \"lineNumber\": 10, \"materialNumber\": \"MTR-7.5KW\", \"quantity\": 4, \"unitOfMeasure\": \"EA\" } ]\n}" }
+      }
+    },
+    {
+      "name": "14 Ops: list dead letters",
+      "event": [{ "listen": "test", "script": { "exec": [
+        "const list = pm.response.json();",
+        "if (list.length > 0) { pm.collectionVariables.set('deadLetterId', list[0].id); }"
+      ] } }],
+      "request": { "method": "GET", "url": "{{prc}}/ops/v1/dead-letters" }
+    },
+    {
+      "name": "15 Mock admin: resolve supplier outage",
+      "request": { "method": "POST", "url": "{{mock}}/admin/supplier-outage/resolve" }
+    },
+    {
+      "name": "16 Ops: replay dead letter (same eventId; requisition created once)",
+      "request": { "method": "POST", "url": "{{prc}}/ops/v1/dead-letters/{{deadLetterId}}/replay" }
+    },
+    {
+      "name": "17 Ops: outbox events",
+      "request": { "method": "GET", "url": "{{prc}}/ops/v1/outbox" }
+    }
+  ]
+}

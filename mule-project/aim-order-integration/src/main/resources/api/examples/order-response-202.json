@@ -1,0 +1,9 @@
+{
+  "orderId": "AIM-20261013-1B2C3D4E",
+  "externalOrderId": "SF-00012347",
+  "status": "PENDING_ERP",
+  "lines": [
+    { "lineNumber": 10, "materialNumber": "PMP-CF-200", "reservedQty": 5, "backorderedQty": 0 }
+  ],
+  "message": "Order accepted. ERP confirmation pending."
+}

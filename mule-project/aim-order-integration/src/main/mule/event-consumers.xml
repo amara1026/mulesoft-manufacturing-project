@@ -1,0 +1,375 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ASYNCHRONOUS CONSUMERS (idempotent receivers)
+  - order-events          -> Salesforce status sync         (inbox dedupe; upsert is naturally idempotent)
+  - procurement-requests  -> purchase requisition per shortage line (business key claim + partner idempotency key)
+  - erp-retry             -> forward recovery for PENDING_ERP orders (lookup-then-create, never blind create)
+  - dead-letter           -> stored for inspection and controlled replay (ops-api.xml)
+
+  Retry policy (local stand-in for broker redelivery): re-publish with deliveryAttempt + 1 and linear backoff;
+  after consumer.maxAttempts the message goes to dead-letter. Non-retryable errors go to dead-letter at once.
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:db="http://www.mulesoft.org/schema/mule/db"
+      xmlns:vm="http://www.mulesoft.org/schema/mule/vm"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+http://www.mulesoft.org/schema/mule/vm http://www.mulesoft.org/schema/mule/vm/current/mule-vm.xsd">
+
+    <!-- ===================== order-events: Salesforce status sync ===================== -->
+    <flow name="order-status-sync-consumer-flow">
+        <vm:listener config-ref="VM_Config" queueName="order-events" numberOfConsumers="2" doc:name="order-events listener"/>
+        <set-variable variableName="evt" value="#[payload]" doc:name="evt"/>
+        <set-variable variableName="consumerName" value="crm-status-sync" doc:name="consumerName"/>
+        <set-variable variableName="sourceQueue" value="order-events" doc:name="sourceQueue"/>
+        <flow-ref name="inbox-check-subflow" doc:name="Inbox check"/>
+        <choice doc:name="Already processed?">
+            <when expression="#[vars.alreadyProcessed]">
+                <logger level="INFO" category="aim.consumer" doc:name="Skip duplicate"
+                        message="#['DUPLICATE_SKIPPED consumer=crm-status-sync eventId=' ++ vars.evt.eventId]"/>
+            </when>
+            <otherwise>
+                <http:request method="PATCH" config-ref="HTTP_Request_Sys_CRM" path="/sys/crm/v1/orders/{externalOrderId}/status"
+                              responseTimeout="${timeouts.crmMs}" doc:name="Update order status in Salesforce System API">
+                    <http:body><![CDATA[#[output application/json --- {
+                        orderId: vars.evt.data.orderId,
+                        status: vars.evt.data.status,
+                        sapOrderNumber: vars.evt.data.sapOrderNumber
+                    }]]]></http:body>
+                    <http:headers><![CDATA[#[{ 'x-correlation-id': vars.evt.correlationId default correlationId }]]]></http:headers>
+                    <http:uri-params><![CDATA[#[{ externalOrderId: vars.evt.data.externalOrderId }]]]></http:uri-params>
+                </http:request>
+                <flow-ref name="inbox-record-subflow" doc:name="Record in inbox"/>
+                <logger level="INFO" category="aim.consumer" doc:name="Log status synced"
+                        message="#['STATUS_SYNCED ' ++ vars.evt.data.externalOrderId ++ ' -> ' ++ vars.evt.data.status]"/>
+            </otherwise>
+        </choice>
+        <error-handler>
+            <on-error-continue type="ANY" doc:name="Retry or dead-letter">
+                <flow-ref name="capture-error-subflow" doc:name="Capture error"/>
+                <flow-ref name="retry-or-dead-letter-subflow" doc:name="Retry or dead-letter"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <!-- ===================== procurement-requests: one requisition per shortage line ===================== -->
+    <flow name="procurement-consumer-flow">
+        <vm:listener config-ref="VM_Config" queueName="procurement-requests" numberOfConsumers="1" doc:name="procurement-requests listener"/>
+        <set-variable variableName="evt" value="#[payload]" doc:name="evt"/>
+        <set-variable variableName="consumerName" value="procurement" doc:name="consumerName"/>
+        <set-variable variableName="sourceQueue" value="procurement-requests" doc:name="sourceQueue"/>
+        <flow-ref name="inbox-check-subflow" doc:name="Inbox check"/>
+        <choice doc:name="Already processed?">
+            <when expression="#[vars.alreadyProcessed]">
+                <logger level="INFO" category="aim.consumer" doc:name="Skip duplicate"
+                        message="#['DUPLICATE_SKIPPED consumer=procurement eventId=' ++ vars.evt.eventId]"/>
+            </when>
+            <otherwise>
+                <foreach collection="#[vars.evt.data.shortages]" doc:name="For each shortage line">
+                    <set-variable variableName="line" value="#[payload]" doc:name="line"/>
+                    <!-- Business key = intent. Catches different events about the same shortage, not just redeliveries. -->
+                    <set-variable variableName="businessKey" value="#[vars.evt.data.orderId ++ ':' ++ vars.line.materialNumber ++ ':' ++ p('order.plant')]" doc:name="businessKey"/>
+                    <set-variable variableName="claimed" value="#[true]" doc:name="claimed = true"/>
+                    <try doc:name="Claim business key">
+                        <db:insert config-ref="Database_Config" doc:name="Insert procurement request (IN_PROGRESS)">
+                            <db:sql><![CDATA[INSERT INTO procurement_request (business_key, order_id, material_number, quantity, status)
+                                             VALUES (:k, :orderId, :material, :qty, 'IN_PROGRESS')]]></db:sql>
+                            <db:input-parameters><![CDATA[#[{ k: vars.businessKey, orderId: vars.evt.data.orderId,
+                                material: vars.line.materialNumber, qty: vars.line.quantity }]]]></db:input-parameters>
+                        </db:insert>
+                        <error-handler>
+                            <on-error-continue type="DB:QUERY_EXECUTION" logException="false" doc:name="Key exists">
+                                <db:select config-ref="Database_Config" doc:name="Existing request status">
+                                    <db:sql><![CDATA[SELECT status FROM procurement_request WHERE business_key = :k]]></db:sql>
+                                    <db:input-parameters><![CDATA[#[{ k: vars.businessKey }]]]></db:input-parameters>
+                                </db:select>
+                                <!-- COMPLETED: skip. IN_PROGRESS (earlier attempt failed mid-way): continue - the supplier call
+                                     carries the same Idempotency-Key, which acts as lookup-before-create on the partner side. -->
+                                <set-variable variableName="claimed" value="#[payload[0].status != 'COMPLETED']" doc:name="claimed?"/>
+                            </on-error-continue>
+                        </error-handler>
+                    </try>
+                    <choice doc:name="Needs a requisition?">
+                        <when expression="#[vars.claimed]">
+                            <http:request method="POST" config-ref="HTTP_Request_Sys_Supplier" path="/sys/supplier/v1/purchase-requisitions"
+                                          responseTimeout="${timeouts.supplierMs}" doc:name="Create purchase requisition via Supplier System API">
+                                <http:body><![CDATA[#[output application/json --- {
+                                    orderId: vars.evt.data.orderId,
+                                    materialNumber: vars.line.materialNumber,
+                                    quantity: vars.line.quantity,
+                                    unitOfMeasure: vars.line.unitOfMeasure default "EA",
+                                    plant: p('order.plant'),
+                                    supplierId: "SUP-0042"
+                                }]]]></http:body>
+                                <http:headers><![CDATA[#[{ 'x-correlation-id': vars.evt.correlationId default correlationId, 'Idempotency-Key': vars.businessKey }]]]></http:headers>
+                            </http:request>
+                            <db:update config-ref="Database_Config" doc:name="Mark procurement request COMPLETED">
+                                <db:sql><![CDATA[UPDATE procurement_request SET status = 'COMPLETED', requisition_number = :r, updated_at = CURRENT_TIMESTAMP
+                                                 WHERE business_key = :k]]></db:sql>
+                                <db:input-parameters><![CDATA[#[{ r: payload.requisitionNumber, k: vars.businessKey }]]]></db:input-parameters>
+                            </db:update>
+                            <logger level="INFO" category="aim.consumer" doc:name="Log requisition"
+                                    message="#['REQUISITION_CREATED ' ++ payload.requisitionNumber ++ ' key=' ++ vars.businessKey]"/>
+                        </when>
+                        <otherwise>
+                            <logger level="INFO" category="aim.consumer" doc:name="Log already done"
+                                    message="#['REQUISITION_ALREADY_EXISTS key=' ++ vars.businessKey]"/>
+                        </otherwise>
+                    </choice>
+                </foreach>
+                <flow-ref name="inbox-record-subflow" doc:name="Record in inbox"/>
+            </otherwise>
+        </choice>
+        <error-handler>
+            <on-error-continue type="ANY" doc:name="Retry or dead-letter">
+                <flow-ref name="capture-error-subflow" doc:name="Capture error"/>
+                <flow-ref name="retry-or-dead-letter-subflow" doc:name="Retry or dead-letter"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <!-- ===================== erp-retry: forward recovery for PENDING_ERP orders ===================== -->
+    <flow name="erp-retry-consumer-flow">
+        <vm:listener config-ref="VM_Config" queueName="erp-retry" numberOfConsumers="1" doc:name="erp-retry listener"/>
+        <set-variable variableName="evt" value="#[payload]" doc:name="evt"/>
+        <set-variable variableName="consumerName" value="erp-retry" doc:name="consumerName"/>
+        <set-variable variableName="sourceQueue" value="erp-retry" doc:name="sourceQueue"/>
+        <set-variable variableName="orderId" value="#[vars.evt.data.orderId]" doc:name="orderId"/>
+        <ee:transform doc:name="Back off before calling SAP again">
+            <ee:variables>
+                <ee:set-variable variableName="backoffMs"><![CDATA[%dw 2.0
+import * from dw::Runtime
+output application/java
+var ms = (p('consumer.backoffBaseMs') as Number) * 2 * ((vars.evt.deliveryAttempt default 1) as Number)
+---
+wait(ms, ms)]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+        <flow-ref name="inbox-check-subflow" doc:name="Inbox check"/>
+        <choice doc:name="Already processed?">
+            <when expression="#[vars.alreadyProcessed]">
+                <logger level="INFO" category="aim.consumer" doc:name="Skip duplicate"
+                        message="#['DUPLICATE_SKIPPED consumer=erp-retry eventId=' ++ vars.evt.eventId]"/>
+            </when>
+            <otherwise>
+                <db:select config-ref="Database_Config" doc:name="Load PENDING_ERP order">
+                    <db:sql><![CDATA[SELECT order_id, order_json, lines_json FROM order_state
+                                     WHERE order_id = :id AND status = 'PENDING_ERP']]></db:sql>
+                    <db:input-parameters><![CDATA[#[{ id: vars.orderId }]]]></db:input-parameters>
+                </db:select>
+                <choice doc:name="Still pending?">
+                    <when expression="#[isEmpty(payload)]">
+                        <logger level="INFO" category="aim.consumer" doc:name="Already resolved"
+                                message="#['ERP_RETRY_NOT_NEEDED orderId=' ++ vars.orderId]"/>
+                        <flow-ref name="inbox-record-subflow" doc:name="Record in inbox"/>
+                    </when>
+                    <otherwise>
+                        <set-variable variableName="stateRow" value="#[payload[0]]" doc:name="stateRow"/>
+                        <!-- ALWAYS look up first: SAP may have committed during the earlier timeout -->
+                        <http:request method="GET" config-ref="HTTP_Request_Sys_SAP" path="/sys/sap/v1/sales-orders"
+                                      responseTimeout="${timeouts.sapSysMs}" doc:name="Lookup SAP order before retrying create">
+                            <http:headers><![CDATA[#[{ 'x-correlation-id': vars.evt.correlationId default correlationId }]]]></http:headers>
+                            <http:query-params><![CDATA[#[{ externalRef: vars.orderId }]]]></http:query-params>
+                            <http:response-validator>
+                                <http:success-status-code-validator values="200..599"/>
+                            </http:response-validator>
+                        </http:request>
+                        <choice doc:name="Found in SAP?">
+                            <when expression="#[attributes.statusCode == 200 and (payload.found default false)]">
+                                <set-variable variableName="sapOrderNumber" value="#[payload.salesOrderNumber]" doc:name="SAP number (found)"/>
+                                <logger level="INFO" category="aim.consumer" doc:name="Found"
+                                        message="#['ERP_RETRY_FOUND_EXISTING orderId=' ++ vars.orderId ++ ' sapOrder=' ++ vars.sapOrderNumber]"/>
+                            </when>
+                            <when expression="#[attributes.statusCode == 200]">
+                                <http:request method="POST" config-ref="HTTP_Request_Sys_SAP" path="/sys/sap/v1/sales-orders"
+                                              responseTimeout="${timeouts.sapSysMs}" doc:name="Retry SAP order creation">
+                                    <http:body><![CDATA[#[output application/json --- read(vars.stateRow.order_json, "application/json") ++ { orderId: vars.orderId }]]]></http:body>
+                                    <http:headers><![CDATA[#[{ 'x-correlation-id': vars.evt.correlationId default correlationId }]]]></http:headers>
+                                    <http:response-validator>
+                                        <http:success-status-code-validator values="200..599"/>
+                                    </http:response-validator>
+                                </http:request>
+                                <choice doc:name="Create result">
+                                    <when expression="#[attributes.statusCode == 201]">
+                                        <set-variable variableName="sapOrderNumber" value="#[payload.salesOrderNumber]" doc:name="SAP number (created)"/>
+                                    </when>
+                                    <when expression="#[attributes.statusCode == 422]">
+                                        <raise-error type="AIM:SAP_BUSINESS_ERROR" description="#['SAP rejected order on retry: ' ++ (payload.error.message default '')]"/>
+                                    </when>
+                                    <otherwise>
+                                        <raise-error type="AIM:SAP_UNAVAILABLE" description="#['SAP still unavailable (HTTP ' ++ (attributes.statusCode as String) ++ ')']"/>
+                                    </otherwise>
+                                </choice>
+                            </when>
+                            <otherwise>
+                                <raise-error type="AIM:SAP_UNAVAILABLE" description="SAP lookup failed; outcome still unknown"/>
+                            </otherwise>
+                        </choice>
+                        <ee:transform doc:name="Rebuild order context">
+                            <ee:variables>
+                                <ee:set-variable variableName="order"><![CDATA[%dw 2.0
+output application/java
+---
+read(vars.stateRow.order_json, "application/json")]]></ee:set-variable>
+                                <ee:set-variable variableName="allocation"><![CDATA[%dw 2.0
+output application/java
+---
+{ lines: read(vars.stateRow.lines_json, "application/json") }]]></ee:set-variable>
+                                <ee:set-variable variableName="orderStatus"><![CDATA[%dw 2.0
+output application/java
+---
+if (isEmpty(read(vars.stateRow.lines_json, "application/json") filter ($.backorderedQty > 0))) "CONFIRMED" else "BACKORDERED"]]></ee:set-variable>
+                            </ee:variables>
+                        </ee:transform>
+                        <ee:transform doc:name="Build events">
+                            <ee:variables>
+                                <ee:set-variable variableName="events" resource="dwl/order-events.dwl"/>
+                            </ee:variables>
+                        </ee:transform>
+                        <try transactionalAction="ALWAYS_BEGIN" doc:name="TX: confirm order + outbox + inbox">
+                            <db:update config-ref="Database_Config" doc:name="PENDING_ERP to confirmed (guarded)">
+                                <db:sql><![CDATA[UPDATE order_state SET status = :status, sap_order_number = :sapNo,
+                                                 version = version + 1, updated_at = CURRENT_TIMESTAMP
+                                                 WHERE order_id = :id AND status = 'PENDING_ERP']]></db:sql>
+                                <db:input-parameters><![CDATA[#[{ status: vars.orderStatus, sapNo: vars.sapOrderNumber, id: vars.orderId }]]]></db:input-parameters>
+                            </db:update>
+                            <choice doc:name="Updated?">
+                                <when expression="#[payload.affectedRows == 0]">
+                                    <raise-error type="AIM:CONCURRENT_UPDATE" description="Order is no longer PENDING_ERP"/>
+                                </when>
+                            </choice>
+                            <foreach collection="#[vars.events]" doc:name="For each event">
+                                <db:insert config-ref="Database_Config" doc:name="Insert outbox event">
+                                    <db:sql><![CDATA[INSERT INTO outbox_event (event_id, aggregate_id, event_type, payload)
+                                                     VALUES (:eventId, :aggregateId, :eventType, :payload)]]></db:sql>
+                                    <db:input-parameters><![CDATA[#[{ eventId: payload.eventId, aggregateId: vars.orderId,
+                                        eventType: payload.eventType, payload: write(payload, "application/json") }]]]></db:input-parameters>
+                                </db:insert>
+                            </foreach>
+                            <flow-ref name="inbox-record-subflow" doc:name="Record in inbox"/>
+                        </try>
+                        <logger level="INFO" category="aim.consumer" doc:name="Log recovered"
+                                message="#['ERP_RETRY_CONFIRMED orderId=' ++ vars.orderId ++ ' status=' ++ vars.orderStatus ++ ' sapOrder=' ++ vars.sapOrderNumber]"/>
+                    </otherwise>
+                </choice>
+            </otherwise>
+        </choice>
+        <error-handler>
+            <on-error-continue type="AIM:SAP_BUSINESS_ERROR" doc:name="Non-retryable: dead-letter now">
+                <!-- Production: also mark the order REJECTED, release the reservation and notify sales ops -->
+                <flow-ref name="capture-error-subflow" doc:name="Capture error"/>
+                <flow-ref name="publish-dead-letter-subflow" doc:name="Dead-letter"/>
+            </on-error-continue>
+            <on-error-continue type="ANY" doc:name="Retry or dead-letter">
+                <flow-ref name="capture-error-subflow" doc:name="Capture error"/>
+                <flow-ref name="retry-or-dead-letter-subflow" doc:name="Retry or dead-letter"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <!-- ===================== dead-letter: persist for inspection and controlled replay ===================== -->
+    <flow name="dead-letter-consumer-flow">
+        <vm:listener config-ref="VM_Config" queueName="dead-letter" numberOfConsumers="1" doc:name="dead-letter listener"/>
+        <db:insert config-ref="Database_Config" doc:name="Store dead letter">
+            <db:sql><![CDATA[INSERT INTO dead_letter_event (id, source_queue, error_type, error_description, message)
+                             VALUES (:id, :q, :t, :d, :m)]]></db:sql>
+            <db:input-parameters><![CDATA[#[{
+                id: uuid(),
+                q: payload.sourceQueue,
+                t: payload.errorType,
+                d: payload.errorDescription,
+                m: write(payload.message, "application/json")
+            }]]]></db:input-parameters>
+        </db:insert>
+        <logger level="ERROR" category="aim.dlq" doc:name="Alert: dead letter"
+                message="#['DEAD_LETTER queue=' ++ (payload.sourceQueue default '?') ++ ' eventId=' ++ (payload.message.eventId default '?') ++ ' error=' ++ (payload.errorType default '?')]"/>
+    </flow>
+
+    <!-- ===================== shared consumer building blocks ===================== -->
+    <sub-flow name="inbox-check-subflow">
+        <db:select config-ref="Database_Config" doc:name="Already processed by this consumer?">
+            <db:sql><![CDATA[SELECT COUNT(*) AS cnt FROM inbox_event WHERE event_id = :id AND consumer = :c]]></db:sql>
+            <db:input-parameters><![CDATA[#[{ id: vars.evt.eventId, c: vars.consumerName }]]]></db:input-parameters>
+        </db:select>
+        <set-variable variableName="alreadyProcessed" value="#[(payload[0].cnt default 0) > 0]" doc:name="alreadyProcessed"/>
+    </sub-flow>
+
+    <!-- Recorded AFTER successful processing (see study kit 08.3 for the trade-offs of this choice) -->
+    <sub-flow name="inbox-record-subflow">
+        <try doc:name="Insert inbox row">
+            <db:insert config-ref="Database_Config" doc:name="Insert inbox event">
+                <db:sql><![CDATA[INSERT INTO inbox_event (event_id, consumer) VALUES (:id, :c)]]></db:sql>
+                <db:input-parameters><![CDATA[#[{ id: vars.evt.eventId, c: vars.consumerName }]]]></db:input-parameters>
+            </db:insert>
+            <error-handler>
+                <on-error-continue type="DB:QUERY_EXECUTION" logException="false" doc:name="Already recorded">
+                    <logger level="DEBUG" category="aim.consumer" doc:name="Already recorded" message="Inbox row already present"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </sub-flow>
+
+    <sub-flow name="capture-error-subflow">
+        <set-variable variableName="lastError" doc:name="lastError"
+                      value="#[{ errorType: error.errorType.namespace ++ ':' ++ error.errorType.identifier, errorDescription: error.description default '' }]"/>
+        <set-variable variableName="attempt" value="#[(vars.evt.deliveryAttempt default 1) as Number]" doc:name="attempt"/>
+        <logger level="WARN" category="aim.consumer" doc:name="Log consumer failure"
+                message="#['CONSUMER_FAILED queue=' ++ vars.sourceQueue ++ ' eventId=' ++ (vars.evt.eventId default '?') ++ ' attempt=' ++ (vars.attempt as String) ++ ' error=' ++ vars.lastError.errorType]"/>
+    </sub-flow>
+
+    <sub-flow name="retry-or-dead-letter-subflow">
+        <choice doc:name="Attempts left?">
+            <when expression="#[vars.attempt &lt; (p('consumer.maxAttempts') as Number)]">
+                <ee:transform doc:name="Next attempt with backoff">
+                    <ee:variables>
+                        <ee:set-variable variableName="retryMessage"><![CDATA[%dw 2.0
+import * from dw::Runtime
+output application/json
+var next = (vars.evt - "deliveryAttempt") ++ { deliveryAttempt: vars.attempt + 1 }
+---
+wait(next, (p('consumer.backoffBaseMs') as Number) * vars.attempt)]]></ee:set-variable>
+                    </ee:variables>
+                </ee:transform>
+                <choice doc:name="Back to source queue">
+                    <when expression="#[vars.sourceQueue == 'order-events']">
+                        <vm:publish config-ref="VM_Config" queueName="order-events" doc:name="Retry on order-events">
+                            <vm:content><![CDATA[#[vars.retryMessage]]]></vm:content>
+                        </vm:publish>
+                    </when>
+                    <when expression="#[vars.sourceQueue == 'procurement-requests']">
+                        <vm:publish config-ref="VM_Config" queueName="procurement-requests" doc:name="Retry on procurement-requests">
+                            <vm:content><![CDATA[#[vars.retryMessage]]]></vm:content>
+                        </vm:publish>
+                    </when>
+                    <otherwise>
+                        <vm:publish config-ref="VM_Config" queueName="erp-retry" doc:name="Retry on erp-retry">
+                            <vm:content><![CDATA[#[vars.retryMessage]]]></vm:content>
+                        </vm:publish>
+                    </otherwise>
+                </choice>
+            </when>
+            <otherwise>
+                <flow-ref name="publish-dead-letter-subflow" doc:name="Dead-letter"/>
+            </otherwise>
+        </choice>
+    </sub-flow>
+
+    <sub-flow name="publish-dead-letter-subflow">
+        <vm:publish config-ref="VM_Config" queueName="dead-letter" doc:name="Publish to dead-letter">
+            <vm:content><![CDATA[#[output application/json --- {
+                sourceQueue: vars.sourceQueue,
+                failedAt: now() as String { format: "yyyy-MM-dd'T'HH:mm:ss.SSSXXX" },
+                attempts: vars.attempt,
+                errorType: vars.lastError.errorType,
+                errorDescription: vars.lastError.errorDescription,
+                message: vars.evt - "deliveryAttempt"
+            }]]]></vm:content>
+        </vm:publish>
+    </sub-flow>
+</mule>

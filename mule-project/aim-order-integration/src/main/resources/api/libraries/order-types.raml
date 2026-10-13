@@ -1,0 +1,99 @@
+#%RAML 1.0 Library
+usage: AIM order data types (canonical order contract for the Experience API)
+types:
+  Address:
+    type: object
+    properties:
+      name:
+        type: string
+        maxLength: 80
+      line1:
+        type: string
+        maxLength: 60
+      city:
+        type: string
+        maxLength: 40
+      postalCode:
+        type: string
+        maxLength: 10
+      country:
+        type: string
+        pattern: "^[A-Z]{2}$"
+
+  OrderLine:
+    type: object
+    properties:
+      lineNumber:
+        type: integer
+        minimum: 1
+      materialNumber:
+        type: string
+        minLength: 3
+        maxLength: 40
+      quantity:
+        type: number
+        minimum: 0.001
+      unitOfMeasure:
+        type: string
+        enum: [ EA, PC, KG, M, BOX ]
+
+  OrderRequest:
+    type: object
+    properties:
+      externalOrderId:
+        type: string
+        minLength: 3
+        maxLength: 35
+      sourceSystem:
+        type: string
+        enum: [ SALESFORCE, B2B_PORTAL, EDI ]
+      customerId:
+        type: string
+        minLength: 3
+        maxLength: 20
+      customerPoNumber:
+        type: string
+        maxLength: 35
+      currency:
+        type: string
+        pattern: "^[A-Z]{3}$"
+      requestedDeliveryDate: date-only
+      shipTo: Address
+      lines:
+        type: array
+        items: OrderLine
+        minItems: 1
+        maxItems: 200
+
+  OrderLineResult:
+    type: object
+    properties:
+      lineNumber: integer
+      materialNumber: string
+      reservedQty: number
+      backorderedQty: number
+
+  OrderResponse:
+    type: object
+    properties:
+      orderId: string
+      externalOrderId: string
+      status:
+        type: string
+        enum: [ CONFIRMED, BACKORDERED, PENDING_ERP, REJECTED ]
+      sapOrderNumber?: string
+      lines?:
+        type: array
+        items: OrderLineResult
+      message?: string
+
+  ErrorResponse:
+    type: object
+    properties:
+      error:
+        type: object
+        properties:
+          code: string
+          message: string
+          correlationId: string
+          timestamp: string

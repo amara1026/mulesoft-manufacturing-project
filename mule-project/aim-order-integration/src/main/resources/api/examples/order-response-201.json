@@ -1,0 +1,10 @@
+{
+  "orderId": "AIM-20261013-7F3A9C21",
+  "externalOrderId": "SF-00012346",
+  "status": "BACKORDERED",
+  "sapOrderNumber": "0000456789",
+  "lines": [
+    { "lineNumber": 10, "materialNumber": "PMP-CF-200", "reservedQty": 5, "backorderedQty": 0 },
+    { "lineNumber": 20, "materialNumber": "VLV-BL-050", "reservedQty": 5, "backorderedQty": 35 }
+  ]
+}

@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  EXPERIENCE LAYER: customer-order-exp-api
+  Responsibilities: contract (RAML via APIkit), request validation, correlation ID, channel mapping.
+  NOT responsible for business rules - those live in the Process API.
+  In production, API Manager policies (JWT validation, rate limiting) run in front of this flow.
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:apikit="http://www.mulesoft.org/schema/mule/mule-apikit"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.mulesoft.org/schema/mule/mule-apikit http://www.mulesoft.org/schema/mule/mule-apikit/current/mule-apikit.xsd">
+
+    <flow name="order-exp-api-main">
+        <http:listener config-ref="HTTP_Listener_Exp" path="/api/*" doc:name="Listener /api/*">
+            <http:response statusCode="#[vars.httpStatus default 200]">
+                <http:headers><![CDATA[#[(vars.outboundHeaders default {}) ++ { 'x-correlation-id': correlationId }]]]></http:headers>
+            </http:response>
+            <http:error-response statusCode="#[vars.httpStatus default 500]">
+                <http:body><![CDATA[#[payload]]]></http:body>
+                <http:headers><![CDATA[#[(vars.outboundHeaders default {}) ++ { 'x-correlation-id': correlationId }]]]></http:headers>
+            </http:error-response>
+        </http:listener>
+        <apikit:router config-ref="order-exp-api-config" doc:name="APIkit router (validates against RAML)"/>
+        <error-handler ref="aim-common-error-handler"/>
+    </flow>
+
+    <!-- POST /api/v1/orders -->
+    <flow name="post:\orders:application\json:order-exp-api-config">
+        <logger level="INFO" category="aim.exp" doc:name="Log order received"
+                message="#['ORDER_RECEIVED externalOrderId=' ++ (payload.externalOrderId default '?') ++ ' customer=' ++ (payload.customerId default '?')]"/>
+        <!-- Pass-through: the Process API already returns AIM-formatted bodies and statuses (2xx/4xx/5xx).
+             Only transport failures (timeout, connection refused) raise errors here. -->
+        <http:request method="POST" config-ref="HTTP_Request_Prc" path="/prc/order-mgmt/v1/orders"
+                      responseTimeout="${timeouts.expToPrcMs}" doc:name="Call Order Management Process API">
+            <http:headers><![CDATA[#[{
+                'x-correlation-id': correlationId,
+                'idempotency-key': (attributes.headers.'idempotency-key' default '')
+            }]]]></http:headers>
+            <http:response-validator>
+                <http:success-status-code-validator values="200..599"/>
+            </http:response-validator>
+        </http:request>
+        <set-variable variableName="httpStatus" value="#[attributes.statusCode]" doc:name="Pass through status"/>
+        <set-variable variableName="outboundHeaders" doc:name="Pass through replay header"
+                      value="#[if (attributes.headers.'idempotent-replayed' != null) { 'idempotent-replayed': attributes.headers.'idempotent-replayed' } else {}]"/>
+    </flow>
+
+    <!-- GET /api/v1/orders/{orderId} -->
+    <flow name="get:\orders\(orderId):order-exp-api-config">
+        <http:request method="GET" config-ref="HTTP_Request_Prc" path="/prc/order-mgmt/v1/orders/{orderId}"
+                      responseTimeout="5000" doc:name="Get order from Order Management Process API">
+            <http:headers><![CDATA[#[{ 'x-correlation-id': correlationId }]]]></http:headers>
+            <http:uri-params><![CDATA[#[{ orderId: attributes.uriParams.orderId }]]]></http:uri-params>
+            <http:response-validator>
+                <http:success-status-code-validator values="200..599"/>
+            </http:response-validator>
+        </http:request>
+        <set-variable variableName="httpStatus" value="#[attributes.statusCode]" doc:name="Pass through status"/>
+    </flow>
+</mule>

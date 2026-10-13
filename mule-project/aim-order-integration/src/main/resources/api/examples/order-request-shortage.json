@@ -1,0 +1,19 @@
+{
+  "externalOrderId": "SF-00012346",
+  "sourceSystem": "SALESFORCE",
+  "customerId": "CUST-100234",
+  "customerPoNumber": "WU-PO-77813",
+  "currency": "USD",
+  "requestedDeliveryDate": "2026-11-20",
+  "shipTo": {
+    "name": "Riverside Water Utility",
+    "line1": "100 River Rd",
+    "city": "Austin",
+    "postalCode": "73301",
+    "country": "US"
+  },
+  "lines": [
+    { "lineNumber": 10, "materialNumber": "PMP-CF-200", "quantity": 5, "unitOfMeasure": "EA" },
+    { "lineNumber": 20, "materialNumber": "VLV-BL-050", "quantity": 40, "unitOfMeasure": "EA" }
+  ]
+}

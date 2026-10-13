@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SYSTEM LAYER: salesforce-sys-api (simulated CRM)
+  Maps Salesforce-shaped Account records (Name, Status__c, Credit_Block__c) to the canonical customer, and
+  updates order status by external ID (naturally idempotent upsert semantics).
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <!-- GET /sys/crm/v1/accounts/{customerId} -->
+    <flow name="sys-crm-get-account-flow">
+        <http:listener config-ref="HTTP_Listener_Sys" path="/sys/crm/v1/accounts/{customerId}" allowedMethods="GET" doc:name="GET /accounts/{customerId}">
+            <http:response statusCode="#[vars.httpStatus default 200]"/>
+            <http:error-response statusCode="#[vars.httpStatus default 500]">
+                <http:body><![CDATA[#[payload]]]></http:body>
+            </http:error-response>
+        </http:listener>
+        <set-variable variableName="customerId" value="#[attributes.uriParams.customerId]" doc:name="customerId"/>
+        <try doc:name="Query account">
+            <http:request method="GET" config-ref="HTTP_Request_Mock_Backends" path="/mock/crm/accounts/{id}"
+                          responseTimeout="${timeouts.crmMs}" doc:name="Salesforce Account query (mock)">
+                <http:headers><![CDATA[#[{ 'x-correlation-id': correlationId }]]]></http:headers>
+                <http:uri-params><![CDATA[#[{ id: vars.customerId }]]]></http:uri-params>
+            </http:request>
+            <ee:transform doc:name="Salesforce Account to canonical customer">
+                <ee:message>
+                    <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  customerId: payload.AIM_Customer_Id__c,
+  name: payload.Name,
+  status: if (payload.Credit_Block__c default false) "BLOCKED" else upper(payload.Status__c default "UNKNOWN")
+}]]></ee:set-payload>
+                </ee:message>
+            </ee:transform>
+            <error-handler>
+                <on-error-continue type="HTTP:NOT_FOUND" logException="false" doc:name="Account not found">
+                    <set-variable variableName="httpStatus" value="#[404]" doc:name="404"/>
+                    <ee:transform doc:name="Not found body">
+                        <ee:message>
+                            <ee:set-payload><![CDATA[%dw 2.0
+import isoNow from dwl::modules::aim::common
+output application/json
+---
+{ error: { code: "AIM-CRM-4041", message: "Customer " ++ vars.customerId ++ " not found", correlationId: correlationId, timestamp: isoNow() } }]]></ee:set-payload>
+                        </ee:message>
+                    </ee:transform>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <!-- PATCH /sys/crm/v1/orders/{externalOrderId}/status -->
+    <flow name="sys-crm-update-order-status-flow">
+        <http:listener config-ref="HTTP_Listener_Sys" path="/sys/crm/v1/orders/{externalOrderId}/status" allowedMethods="PATCH" doc:name="PATCH /orders/{id}/status">
+            <http:error-response statusCode="#[vars.httpStatus default 500]">
+                <http:body><![CDATA[#[payload]]]></http:body>
+            </http:error-response>
+        </http:listener>
+        <ee:transform doc:name="Canonical status to Salesforce fields">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  AIM_Order_Id__c: payload.orderId,
+  Status: payload.status match {
+    case "CONFIRMED" -> "Confirmed"
+    case "BACKORDERED" -> "Confirmed - Backordered"
+    case "PENDING_ERP" -> "Pending ERP"
+    else -> payload.status
+  },
+  SAP_Order_Number__c: payload.sapOrderNumber
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <http:request method="PATCH" config-ref="HTTP_Request_Mock_Backends" path="/mock/crm/orders/{id}/status"
+                      responseTimeout="${timeouts.crmMs}" doc:name="Salesforce Order upsert by external ID (mock)">
+            <http:headers><![CDATA[#[{ 'x-correlation-id': correlationId }]]]></http:headers>
+            <http:uri-params><![CDATA[#[{ id: attributes.uriParams.externalOrderId }]]]></http:uri-params>
+        </http:request>
+    </flow>
+</mule>

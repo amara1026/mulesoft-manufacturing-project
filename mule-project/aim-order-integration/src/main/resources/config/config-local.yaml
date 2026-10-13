@@ -1,0 +1,48 @@
+# Local (Anypoint Studio) configuration. All values are training assumptions.
+# One app hosts all layers on separate ports; in production each layer is its own Mule application.
+http:
+  exp:
+    port: "8081"        # Experience layer (public)
+  prc:
+    host: "localhost"
+    port: "8082"        # Process layer (internal)
+  sys:
+    host: "localhost"
+    port: "8083"        # System layer (internal)
+  mock:
+    host: "localhost"
+    port: "8091"        # Simulated backends: SAP, WMS, CRM, SupplierHub
+
+# Timeout budget: client(20s) > exp->prc(15s) > scatter-gather(3s) + reserve(2.5s) + prc->sapSys(7s)
+# sapSys(7s) > sap create(3s) + lookup(2s) so the System API can finish its own recovery first.
+timeouts:
+  expToPrcMs: "15000"
+  scatterGatherMs: "3000"
+  crmMs: "2500"
+  wmsMs: "2500"
+  sapSysMs: "7000"
+  sapCreateMs: "3000"
+  sapLookupMs: "2000"
+  supplierMs: "5000"
+
+mock:
+  sap:
+    slowDelayMs: "5000"   # > timeouts.sapCreateMs, so TIMEOUT-/SAPDOWN- scenarios really time out
+
+db:
+  url: "jdbc:h2:mem:aimdb;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1"
+  driver: "org.h2.Driver"
+  user: "sa"
+  password: ""
+  maxPool: "10"
+
+outbox:
+  pollSeconds: "3"
+
+consumer:
+  maxAttempts: "3"        # attempts before a message goes to the dead-letter queue
+  backoffBaseMs: "1000"   # linear backoff per attempt (production: broker delivery delay / exponential)
+
+order:
+  reservationTtlMinutes: "30"
+  plant: "1000"

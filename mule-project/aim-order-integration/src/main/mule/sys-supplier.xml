@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SYSTEM LAYER: supplier-sys-api (simulated SupplierHub)
+  Forwards the caller's Idempotency-Key so the partner can deduplicate retries (defence in depth).
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <!-- POST /sys/supplier/v1/purchase-requisitions -->
+    <flow name="sys-supplier-create-requisition-flow">
+        <http:listener config-ref="HTTP_Listener_Sys" path="/sys/supplier/v1/purchase-requisitions" allowedMethods="POST" doc:name="POST /purchase-requisitions">
+            <http:response statusCode="201"/>
+            <http:error-response statusCode="#[vars.httpStatus default 500]">
+                <http:body><![CDATA[#[payload]]]></http:body>
+            </http:error-response>
+        </http:listener>
+        <set-variable variableName="idempotencyKey" value="#[attributes.headers.'idempotency-key' default '']" doc:name="Idempotency-Key"/>
+        <ee:transform doc:name="Canonical to SupplierHub requisition">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  buyerReference: payload.orderId,
+  supplier: payload.supplierId,
+  plant: payload.plant,
+  item: { materialCode: payload.materialNumber, quantity: payload.quantity, unit: payload.unitOfMeasure default "EA" }
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <http:request method="POST" config-ref="HTTP_Request_Mock_Backends" path="/mock/supplier/purchase-requisitions"
+                      responseTimeout="${timeouts.supplierMs}" doc:name="SupplierHub create requisition (mock)">
+            <http:headers><![CDATA[#[{ 'x-correlation-id': correlationId, 'Idempotency-Key': vars.idempotencyKey }]]]></http:headers>
+        </http:request>
+        <ee:transform doc:name="SupplierHub response to canonical">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ requisitionNumber: payload.requisitionNo, replayedByPartner: payload.replayed default false }]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+</mule>

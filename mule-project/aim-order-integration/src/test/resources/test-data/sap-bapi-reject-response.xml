@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<BAPI_SALESORDER_CREATEFROMDAT2>
+  <export>
+    <SALESDOCUMENT></SALESDOCUMENT>
+  </export>
+  <tables>
+    <RETURN>
+      <row>
+        <TYPE>E</TYPE>
+        <ID>V1</ID>
+        <NUMBER>154</NUMBER>
+        <MESSAGE>Sold-to party 0000100234 blocked for sales (credit limit exceeded)</MESSAGE>
+      </row>
+    </RETURN>
+  </tables>
+</BAPI_SALESORDER_CREATEFROMDAT2>

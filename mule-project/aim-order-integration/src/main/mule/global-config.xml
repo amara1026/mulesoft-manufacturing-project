@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Global configuration: properties, listeners (one per layer), requesters (one per backend = bulkheads),
+  integration database, VM queues (local stand-in for Anypoint MQ), object stores, APIkit.
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:db="http://www.mulesoft.org/schema/mule/db"
+      xmlns:vm="http://www.mulesoft.org/schema/mule/vm"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:apikit="http://www.mulesoft.org/schema/mule/mule-apikit"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+http://www.mulesoft.org/schema/mule/vm http://www.mulesoft.org/schema/mule/vm/current/mule-vm.xsd
+http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+http://www.mulesoft.org/schema/mule/mule-apikit http://www.mulesoft.org/schema/mule/mule-apikit/current/mule-apikit.xsd">
+
+    <!-- ===== Properties: one artifact, many environments (-Denv=dev overrides the default) ===== -->
+    <global-property doc:name="Default environment" name="env" value="local"/>
+    <configuration-properties doc:name="Environment properties" file="config/config-${env}.yaml"/>
+    <!-- Every flow without its own handler maps errors to the AIM error contract -->
+    <configuration doc:name="Default error handler" defaultErrorHandler-ref="aim-common-error-handler"/>
+
+    <!-- ===== Listeners: one per layer (in production: one app per API) ===== -->
+    <http:listener-config name="HTTP_Listener_Exp" doc:name="Experience layer listener">
+        <http:listener-connection host="0.0.0.0" port="${http.exp.port}"/>
+    </http:listener-config>
+    <http:listener-config name="HTTP_Listener_Prc" doc:name="Process layer listener">
+        <http:listener-connection host="0.0.0.0" port="${http.prc.port}"/>
+    </http:listener-config>
+    <http:listener-config name="HTTP_Listener_Sys" doc:name="System layer listener">
+        <http:listener-connection host="0.0.0.0" port="${http.sys.port}"/>
+    </http:listener-config>
+    <http:listener-config name="HTTP_Listener_Mock" doc:name="Mock backends listener">
+        <http:listener-connection host="0.0.0.0" port="${http.mock.port}"/>
+    </http:listener-config>
+
+    <!-- ===== Requesters: separate config + pool per target = bulkhead isolation ===== -->
+    <http:request-config name="HTTP_Request_Prc" doc:name="Order Process API client">
+        <http:request-connection host="${http.prc.host}" port="${http.prc.port}" maxConnections="20"/>
+    </http:request-config>
+    <http:request-config name="HTTP_Request_Sys_CRM" doc:name="CRM System API client">
+        <http:request-connection host="${http.sys.host}" port="${http.sys.port}" maxConnections="10"/>
+    </http:request-config>
+    <http:request-config name="HTTP_Request_Sys_WMS" doc:name="WMS System API client">
+        <http:request-connection host="${http.sys.host}" port="${http.sys.port}" maxConnections="10"/>
+    </http:request-config>
+    <http:request-config name="HTTP_Request_Sys_SAP" doc:name="SAP System API client">
+        <http:request-connection host="${http.sys.host}" port="${http.sys.port}" maxConnections="10"/>
+    </http:request-config>
+    <http:request-config name="HTTP_Request_Sys_Supplier" doc:name="Supplier System API client">
+        <http:request-connection host="${http.sys.host}" port="${http.sys.port}" maxConnections="5"/>
+    </http:request-config>
+    <http:request-config name="HTTP_Request_Mock_Backends" doc:name="Simulated backends client">
+        <http:request-connection host="${http.mock.host}" port="${http.mock.port}" maxConnections="20"/>
+    </http:request-config>
+
+    <!-- ===== Integration database (H2 in PostgreSQL mode locally; PostgreSQL in real environments) ===== -->
+    <db:config name="Database_Config" doc:name="Integration DB">
+        <db:generic-connection url="${db.url}" driverClassName="${db.driver}" user="${db.user}" password="${db.password}">
+            <db:pooling-profile maxPoolSize="${db.maxPool}" minPoolSize="1"/>
+        </db:generic-connection>
+    </db:config>
+
+    <!-- ===== VM queues: local stand-in for Anypoint MQ (production uses exchanges, queues and native DLQs) ===== -->
+    <vm:config name="VM_Config" doc:name="VM queues">
+        <vm:queues>
+            <vm:queue queueName="order-events" queueType="TRANSIENT"/>
+            <vm:queue queueName="procurement-requests" queueType="TRANSIENT"/>
+            <vm:queue queueName="erp-retry" queueType="TRANSIENT"/>
+            <vm:queue queueName="dead-letter" queueType="TRANSIENT"/>
+        </vm:queues>
+    </vm:config>
+
+    <!-- ===== Object stores used only by the simulated backends ===== -->
+    <os:object-store name="SAP_Mock_Store" doc:name="Mock SAP document store" persistent="false"/>
+    <os:object-store name="Supplier_Mock_Store" doc:name="Mock SupplierHub store" persistent="false"/>
+
+    <!-- ===== APIkit: contract-first routing and request validation for the Experience API ===== -->
+    <apikit:config name="order-exp-api-config" api="order-exp-api.raml"
+                   outboundHeadersMapName="outboundHeaders" httpStatusVarName="httpStatus" doc:name="APIkit config"/>
+</mule>

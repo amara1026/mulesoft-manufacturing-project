@@ -1,0 +1,130 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  OPERATIONS API (internal, port 8082): dead-letter inspection, controlled replay, outbox visibility.
+  Production: protect with an ops-only OAuth scope, audit every replay (who/why), rate-limit bulk replays.
+  Replay keeps the ORIGINAL eventId so consumer inbox/business keys still prevent duplicates.
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:db="http://www.mulesoft.org/schema/mule/db"
+      xmlns:vm="http://www.mulesoft.org/schema/mule/vm"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+http://www.mulesoft.org/schema/mule/vm http://www.mulesoft.org/schema/mule/vm/current/mule-vm.xsd">
+
+    <!-- GET /prc/ops/v1/dead-letters -->
+    <flow name="ops-list-dead-letters-flow">
+        <http:listener config-ref="HTTP_Listener_Prc" path="/prc/ops/v1/dead-letters" allowedMethods="GET" doc:name="GET /dead-letters">
+            <http:error-response statusCode="#[vars.httpStatus default 500]">
+                <http:body><![CDATA[#[payload]]]></http:body>
+            </http:error-response>
+        </http:listener>
+        <db:select config-ref="Database_Config" doc:name="Select dead letters">
+            <db:sql><![CDATA[SELECT id, source_queue, error_type, error_description, message, created_at, replayed_at
+                             FROM dead_letter_event ORDER BY created_at DESC FETCH FIRST 100 ROWS ONLY]]></db:sql>
+        </db:select>
+        <ee:transform doc:name="Dead letters response">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload map {
+  id: $.id,
+  sourceQueue: $.source_queue,
+  errorType: $.error_type,
+  errorDescription: $.error_description,
+  createdAt: $.created_at as String,
+  replayedAt: if ($.replayed_at != null) $.replayed_at as String else null,
+  eventId: read($.message, "application/json").eventId,
+  eventType: read($.message, "application/json").eventType,
+  message: read($.message, "application/json")
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- POST /prc/ops/v1/dead-letters/{id}/replay -->
+    <flow name="ops-replay-dead-letter-flow">
+        <http:listener config-ref="HTTP_Listener_Prc" path="/prc/ops/v1/dead-letters/{id}/replay" allowedMethods="POST" doc:name="POST /dead-letters/{id}/replay">
+            <http:error-response statusCode="#[vars.httpStatus default 500]">
+                <http:body><![CDATA[#[payload]]]></http:body>
+            </http:error-response>
+        </http:listener>
+        <set-variable variableName="deadLetterId" value="#[attributes.uriParams.id]" doc:name="deadLetterId"/>
+        <db:select config-ref="Database_Config" doc:name="Load dead letter">
+            <db:sql><![CDATA[SELECT source_queue, message FROM dead_letter_event WHERE id = :id]]></db:sql>
+            <db:input-parameters><![CDATA[#[{ id: vars.deadLetterId }]]]></db:input-parameters>
+        </db:select>
+        <choice doc:name="Found?">
+            <when expression="#[isEmpty(payload)]">
+                <raise-error type="AIM:DEAD_LETTER_NOT_FOUND" description="Dead letter not found"/>
+            </when>
+        </choice>
+        <set-variable variableName="sourceQueue" value="#[payload[0].source_queue]" doc:name="sourceQueue"/>
+        <ee:transform doc:name="Original message, attempts reset">
+            <ee:variables>
+                <ee:set-variable variableName="replayMessage"><![CDATA[%dw 2.0
+output application/json
+---
+read(payload[0].message, "application/json") - "deliveryAttempt"]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+        <choice doc:name="Publish back to source queue">
+            <when expression="#[vars.sourceQueue == 'order-events']">
+                <vm:publish config-ref="VM_Config" queueName="order-events" doc:name="Replay to order-events">
+                    <vm:content><![CDATA[#[vars.replayMessage]]]></vm:content>
+                </vm:publish>
+            </when>
+            <when expression="#[vars.sourceQueue == 'procurement-requests']">
+                <vm:publish config-ref="VM_Config" queueName="procurement-requests" doc:name="Replay to procurement-requests">
+                    <vm:content><![CDATA[#[vars.replayMessage]]]></vm:content>
+                </vm:publish>
+            </when>
+            <otherwise>
+                <vm:publish config-ref="VM_Config" queueName="erp-retry" doc:name="Replay to erp-retry">
+                    <vm:content><![CDATA[#[vars.replayMessage]]]></vm:content>
+                </vm:publish>
+            </otherwise>
+        </choice>
+        <db:update config-ref="Database_Config" doc:name="Mark replayed (audit)">
+            <db:sql><![CDATA[UPDATE dead_letter_event SET replayed_at = CURRENT_TIMESTAMP WHERE id = :id]]></db:sql>
+            <db:input-parameters><![CDATA[#[{ id: vars.deadLetterId }]]]></db:input-parameters>
+        </db:update>
+        <logger level="WARN" category="aim.ops" doc:name="Audit replay"
+                message="#['DLQ_REPLAY id=' ++ vars.deadLetterId ++ ' queue=' ++ vars.sourceQueue]"/>
+        <ee:transform doc:name="Replay response">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ replayed: true, deadLetterId: vars.deadLetterId, queue: vars.sourceQueue, eventId: vars.replayMessage.eventId }]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- GET /prc/ops/v1/outbox  (visibility of the outbox relay) -->
+    <flow name="ops-list-outbox-flow">
+        <http:listener config-ref="HTTP_Listener_Prc" path="/prc/ops/v1/outbox" allowedMethods="GET" doc:name="GET /outbox"/>
+        <db:select config-ref="Database_Config" doc:name="Select outbox events">
+            <db:sql><![CDATA[SELECT event_id, aggregate_id, event_type, status, attempts, created_at, published_at
+                             FROM outbox_event ORDER BY created_at DESC FETCH FIRST 100 ROWS ONLY]]></db:sql>
+        </db:select>
+        <ee:transform doc:name="Outbox response">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload map {
+  eventId: $.event_id, orderId: $.aggregate_id, eventType: $.event_type, status: $.status, attempts: $.attempts,
+  createdAt: $.created_at as String,
+  publishedAt: if ($.published_at != null) $.published_at as String else null
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+</mule>

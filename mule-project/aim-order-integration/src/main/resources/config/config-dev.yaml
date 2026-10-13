@@ -1,0 +1,47 @@
+# Example DEV configuration (e.g. CloudHub 2.0 shared space, single replica).
+# Same structure as config-local.yaml; in a real project the hosts point to separately deployed
+# Process/System APIs and the DB URL points to PostgreSQL (see README "Swap H2 for PostgreSQL").
+http:
+  exp:
+    port: "8081"
+  prc:
+    host: "localhost"
+    port: "8082"
+  sys:
+    host: "localhost"
+    port: "8083"
+  mock:
+    host: "localhost"
+    port: "8091"
+
+timeouts:
+  expToPrcMs: "15000"
+  scatterGatherMs: "3000"
+  crmMs: "2500"
+  wmsMs: "2500"
+  sapSysMs: "7000"
+  sapCreateMs: "3000"
+  sapLookupMs: "2000"
+  supplierMs: "5000"
+
+mock:
+  sap:
+    slowDelayMs: "5000"
+
+db:
+  url: "jdbc:h2:mem:aimdb;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1"
+  driver: "org.h2.Driver"
+  user: "sa"
+  password: ""
+  maxPool: "10"
+
+outbox:
+  pollSeconds: "3"
+
+consumer:
+  maxAttempts: "3"
+  backoffBaseMs: "1000"
+
+order:
+  reservationTtlMinutes: "30"
+  plant: "1000"

@@ -1,0 +1,8 @@
+{
+  "error": {
+    "code": "AIM-ORD-4001",
+    "message": "/lines expected minimum item count: 1, found: 0",
+    "correlationId": "c0a8012e-7f3a-4b1e-9e55-1c2d3e4f5a6b",
+    "timestamp": "2026-10-13T08:02:02.341Z"
+  }
+}

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Global error handler: maps every Mule error type to an HTTP status + AIM error code (dwl/modules/aim/errors.dwl)
+  and builds the standard error body. 5xx responses hide internal details; the correlationId links to the logs.
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <error-handler name="aim-common-error-handler" doc:name="AIM common error handler">
+        <on-error-propagate type="ANY" logException="false" doc:name="Map error to AIM error contract">
+            <ee:transform doc:name="Build AIM error response">
+                <ee:message>
+                    <ee:set-payload resource="dwl/error-response.dwl"/>
+                </ee:message>
+                <ee:variables>
+                    <ee:set-variable variableName="httpStatus" resource="dwl/error-status.dwl"/>
+                </ee:variables>
+            </ee:transform>
+            <logger level="WARN" category="aim.errors" doc:name="Log error summary"
+                    message="#[output application/json --- { event: 'REQUEST_FAILED', httpStatus: vars.httpStatus, code: payload.error.code, errorType: error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: error.description }]"/>
+        </on-error-propagate>
+    </error-handler>
+</mule>
